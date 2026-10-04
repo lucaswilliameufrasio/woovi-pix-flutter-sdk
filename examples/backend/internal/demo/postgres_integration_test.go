@@ -248,13 +248,14 @@ func TestPostgresChargeCreateCrashWindowsRecoverWithoutDuplicatePost(t *testing.
 	}
 	orderBeforePost := "crash-before-post-" + time.Now().Format("150405.000000000")
 	orderAfterAcceptance := "crash-after-accept-" + time.Now().Format("150405.000000000")
-	for _, orderID := range []string{orderBeforePost, orderAfterAcceptance} {
+	orderCancelled := "cancelled-post-" + time.Now().Format("150405.000000000")
+	for _, orderID := range []string{orderBeforePost, orderAfterAcceptance, orderCancelled} {
 		if _, err := store.pool.Exec(ctx, `INSERT INTO demo_orders(order_id, amount_cents) VALUES ($1, $2)`, orderID, 6981); err != nil {
 			t.Fatal(err)
 		}
 	}
 	t.Cleanup(func() {
-		for _, orderID := range []string{orderBeforePost, orderAfterAcceptance} {
+		for _, orderID := range []string{orderBeforePost, orderAfterAcceptance, orderCancelled} {
 			if _, err := store.pool.Exec(ctx, `DELETE FROM webhook_events WHERE correlation_id IN (SELECT correlation_id FROM psp_charge_attempts WHERE order_id=$1)`, orderID); err != nil {
 				t.Errorf("cleanup webhook events: %v", err)
 			}
@@ -283,10 +284,18 @@ func TestPostgresChargeCreateCrashWindowsRecoverWithoutDuplicatePost(t *testing.
 	if err := store.MarkChargeAttemptSubmitting(ctx, accepted.ID, now); err != nil {
 		t.Fatal(err)
 	}
+	cancelled, err := store.ReserveChargeAttempt(ctx, orderCancelled, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkChargeAttemptSubmitting(ctx, cancelled.ID, now); err != nil {
+		t.Fatal(err)
+	}
 
 	var mu sync.Mutex
 	charges := make(map[string]int64)
 	postCount, getCount := 0, 0
+	requestStarted := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -300,6 +309,11 @@ func TestPostgresChargeCreateCrashWindowsRecoverWithoutDuplicatePost(t *testing.
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				t.Errorf("decode fixture create request: %v", err)
 				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if request.CorrelationID == cancelled.CorrelationID {
+				requestStarted <- struct{}{}
+				<-r.Context().Done()
 				return
 			}
 			charges[request.CorrelationID] = request.Value
@@ -340,6 +354,27 @@ func TestPostgresChargeCreateCrashWindowsRecoverWithoutDuplicatePost(t *testing.
 		t.Fatalf("pre-POST crash state=%q err=%v", state, err)
 	}
 
+	// Cancellation after the fixture has received the POST is ambiguous too:
+	// it is never replayed, and recovery only performs a correlationID GET.
+	postCtx, cancelPost := context.WithCancel(ctx)
+	postResult := make(chan error, 1)
+	go func() {
+		_, err := client.CreateCharge(postCtx, cancelled.CorrelationID, cancelled.AmountCents)
+		postResult <- err
+	}()
+	<-requestStarted
+	cancelPost()
+	if err := <-postResult; err == nil {
+		t.Fatal("cancelled in-flight POST must return an uncertain error")
+	}
+	cancelled.State = ChargeAttemptSubmitting
+	if _, err := ReconcileChargeAttempt(ctx, store, client, cancelled, now.Add(2*time.Second)); err == nil {
+		t.Fatal("cancelled POST without an accepted fixture charge must remain unresolved")
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM psp_charge_attempts WHERE attempt_id=$1`, cancelled.ID).Scan(&state); err != nil || state != string(ChargeAttemptSubmitting) {
+		t.Fatalf("cancelled POST changed durable state=%q err=%v", state, err)
+	}
+
 	// Woovi accepts the POST, then the database becomes unavailable before the
 	// response can be persisted. Recovery is GET-only with the same correlationID.
 	createdCharge, err := client.CreateCharge(ctx, accepted.CorrelationID, accepted.AmountCents)
@@ -361,8 +396,8 @@ func TestPostgresChargeCreateCrashWindowsRecoverWithoutDuplicatePost(t *testing.
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if postCount != 1 || getCount != 2 {
-		t.Fatalf("POST count=%d GET count=%d, want 1/2", postCount, getCount)
+	if postCount != 2 || getCount != 3 {
+		t.Fatalf("POST count=%d GET count=%d, want 2/3", postCount, getCount)
 	}
 	if err := store.pool.QueryRow(ctx, `SELECT state FROM psp_charge_attempts WHERE attempt_id=$1`, accepted.ID).Scan(&state); err != nil || state != string(ChargeAttemptResolved) {
 		t.Fatalf("recovered attempt state=%q err=%v", state, err)
