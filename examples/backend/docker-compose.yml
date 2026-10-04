@@ -2,7 +2,7 @@ name: woovi-pix-flutter-sdk-demo
 
 services:
   postgres:
-    image: postgres:17-alpine
+    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
     environment:
       POSTGRES_USER: woovi_demo
       POSTGRES_PASSWORD: woovi_demo
@@ -15,7 +15,7 @@ services:
       timeout: 3s
       retries: 20
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql
 
 volumes:
   postgres_data:

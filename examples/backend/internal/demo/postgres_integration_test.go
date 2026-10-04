@@ -654,6 +654,44 @@ func TestPostgresConcurrentChargeReservationsShareOneAttempt(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("active PSP attempt rows=%d, want one", count)
 	}
+
+	// A durable reserved row is known to be pre-network. After a restart,
+	// concurrent callers may all recover it, but only one may cross the
+	// submitting boundary and become eligible to issue the single POST.
+	recoveryStore, err := OpenPostgres(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(recoveryStore.Close)
+	const resumptions = 12
+	transitionResults := make(chan error, resumptions)
+	for range resumptions {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			transitionResults <- recoveryStore.MarkChargeAttemptSubmitting(ctx, first.ID, time.Now().UTC())
+		}()
+	}
+	wait.Wait()
+	close(transitionResults)
+	submittingTransitions := 0
+	for err := range transitionResults {
+		if err == nil {
+			submittingTransitions++
+		} else if !errors.Is(err, ErrChargeAttemptState) {
+			t.Fatalf("reserved resume returned unexpected error: %v", err)
+		}
+	}
+	if submittingTransitions != 1 {
+		t.Fatalf("reserved resume crossed submitting boundary %d times, want exactly once", submittingTransitions)
+	}
+	resumed, err := recoveryStore.ReserveChargeAttempt(ctx, orderID, time.Now().UTC())
+	if err != nil || resumed.ID != first.ID || resumed.State != ChargeAttemptSubmitting {
+		t.Fatalf("recovered attempt = %#v, err=%v", resumed, err)
+	}
+	if err := recoveryStore.MarkChargeAttemptSubmitting(ctx, resumed.ID, time.Now().UTC()); !errors.Is(err, ErrChargeAttemptState) {
+		t.Fatalf("uncertain submitting attempt must never re-enter POST boundary: %v", err)
+	}
 }
 
 func TestPostgresReconciliationClaimsLeaseAndBackoffRecover(t *testing.T) {

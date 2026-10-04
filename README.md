@@ -13,7 +13,8 @@ A Flutter package and example merchant backend for displaying a Pix checkout. Th
 ## Requirements
 
 - Flutter 3.24+ / Dart 3.5+
-- Go 1.23+
+- Go 1.27.1 (pinned in `.mise.toml` and `examples/backend/go.mod`)
+- PostgreSQL 18 (image pinned by digest in `examples/backend/docker-compose.yml`)
 
 ## Run the demo
 
@@ -21,9 +22,10 @@ Start the isolated local PostgreSQL service and backend (migrations apply on sta
 
 ```sh
 cd examples/backend
+mise install
 docker compose -p woovi-pix-flutter-sdk-demo up -d postgres
 PGPORT="$(docker compose -p woovi-pix-flutter-sdk-demo port postgres 5432 | sed 's/.*://')"
-DATABASE_URL="postgres://woovi_demo:woovi_demo@127.0.0.1:${PGPORT}/woovi_demo?sslmode=disable" ENABLE_DEMO_PSP=true go run ./cmd/server
+DATABASE_URL="postgres://woovi_demo:woovi_demo@127.0.0.1:${PGPORT}/woovi_demo?sslmode=disable" ENABLE_DEMO_PSP=true mise exec -- go run ./cmd/server
 ```
 
 In another terminal:
