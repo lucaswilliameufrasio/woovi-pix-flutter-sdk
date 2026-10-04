@@ -300,3 +300,65 @@ func TestPostgresAmbiguousChargeCanOnlyResolveThroughLookup(t *testing.T) {
 		t.Fatalf("resolved attempt must not be reconciled/posted as unknown again: %v", err)
 	}
 }
+
+func TestPostgresConcurrentChargeReservationsShareOneAttempt(t *testing.T) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("set DATABASE_URL to run PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	store, err := OpenPostgres(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	orderID := "reserve-race-" + time.Now().Format("150405.000000000")
+	if _, err := store.pool.Exec(ctx, `INSERT INTO demo_orders(order_id, amount_cents) VALUES ($1,$2)`, orderID, 8801); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.pool.Exec(ctx, `DELETE FROM psp_charge_attempts WHERE order_id=$1`, orderID); err != nil {
+			t.Errorf("cleanup charge attempts: %v", err)
+		}
+		if _, err := store.pool.Exec(ctx, `DELETE FROM demo_orders WHERE order_id=$1`, orderID); err != nil {
+			t.Errorf("cleanup demo order: %v", err)
+		}
+	})
+
+	const workers = 12
+	type outcome struct {
+		attempt ChargeAttempt
+		err     error
+	}
+	results := make(chan outcome, workers)
+	var wait sync.WaitGroup
+	for range workers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			attempt, err := store.ReserveChargeAttempt(ctx, orderID, time.Now().UTC())
+			results <- outcome{attempt: attempt, err: err}
+		}()
+	}
+	wait.Wait()
+	close(results)
+	var first ChargeAttempt
+	for result := range results {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if first.ID == "" {
+			first = result.attempt
+		}
+		if result.attempt.ID != first.ID || result.attempt.CorrelationID != first.CorrelationID {
+			t.Fatalf("concurrent reservations diverged: first=%#v next=%#v", first, result.attempt)
+		}
+	}
+	var count int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM psp_charge_attempts WHERE order_id=$1`, orderID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("active PSP attempt rows=%d, want one", count)
+	}
+}

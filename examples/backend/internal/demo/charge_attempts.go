@@ -37,7 +37,10 @@ type ChargeCreator interface {
 // ReserveChargeAttempt commits an immutable amount and PSP correlation ID before
 // any network request. At most one active PSP attempt may exist for an order.
 func (s *PostgresStore) ReserveChargeAttempt(ctx context.Context, orderID string, now time.Time) (ChargeAttempt, error) {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	// The order row lock serializes reservations for one order. Read Committed is
+	// intentional: after waiting for that lock, the next SELECT must see the
+	// reservation committed by the transaction ahead of us.
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return ChargeAttempt{}, err
 	}
