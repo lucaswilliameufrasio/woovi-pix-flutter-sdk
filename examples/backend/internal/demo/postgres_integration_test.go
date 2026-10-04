@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"sync"
 	"testing"
@@ -233,5 +235,68 @@ func TestPostgresChargeAttemptReservationAndAmbiguousRecovery(t *testing.T) {
 	}
 	if state != string(ChargeAttemptCreated) || brCode != charge.BRCode {
 		t.Fatalf("persisted PSP outcome state=%s br_code=%s", state, brCode)
+	}
+}
+
+func TestPostgresAmbiguousChargeCanOnlyResolveThroughLookup(t *testing.T) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("set DATABASE_URL to run PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	store, err := OpenPostgres(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	orderID := "lookup-" + time.Now().Format("150405.000000000")
+	if _, err := store.pool.Exec(ctx, `INSERT INTO demo_orders(order_id, amount_cents) VALUES ($1,$2)`, orderID, 3210); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.pool.Exec(ctx, `DELETE FROM psp_charge_attempts WHERE order_id=$1`, orderID)
+		_, _ = store.pool.Exec(ctx, `DELETE FROM demo_orders WHERE order_id=$1`, orderID)
+	})
+	now := time.Now().UTC()
+	attempt, err := store.ReserveChargeAttempt(ctx, orderID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkChargeAttemptSubmitting(ctx, attempt.ID, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordChargeAttemptUnknown(ctx, attempt.ID, "timeout", now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	attempt.State = ChargeAttemptUnknown // a restarted worker loads this state from the recovery queue
+	lookups := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lookups++
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/charge/"+attempt.CorrelationID {
+			t.Errorf("lookup request %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"charge":{"correlationID":"` + attempt.CorrelationID + `","value":3210,"status":"ACTIVE","brCode":"pix-reconciled","expiresDate":"` + now.Add(15*time.Minute).Format(time.RFC3339) + `"}}`))
+	}))
+	defer server.Close()
+	client, err := NewWooviChargeClient("fixture-app-id", server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	charge, err := ReconcileChargeAttempt(ctx, store, client, attempt, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lookups != 1 || charge.Status != "ACTIVE" || charge.Value != attempt.AmountCents {
+		t.Fatalf("lookup count=%d charge=%#v", lookups, charge)
+	}
+	var state, providerStatus string
+	if err := store.pool.QueryRow(ctx, `SELECT state, provider_status FROM psp_charge_attempts WHERE attempt_id=$1`, attempt.ID).Scan(&state, &providerStatus); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(ChargeAttemptResolved) || providerStatus != "ACTIVE" {
+		t.Fatalf("persisted reconciliation state=%s provider_status=%s", state, providerStatus)
+	}
+	if _, err := ReconcileChargeAttempt(ctx, store, client, attempt, now.Add(4*time.Second)); !errors.Is(err, ErrChargeAttemptState) {
+		t.Fatalf("resolved attempt must not be reconciled/posted as unknown again: %v", err)
 	}
 }

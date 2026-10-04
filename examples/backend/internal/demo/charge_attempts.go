@@ -3,6 +3,7 @@ package demo
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -15,6 +16,7 @@ const (
 	ChargeAttemptSubmitting ChargeAttemptState = "submitting"
 	ChargeAttemptUnknown    ChargeAttemptState = "unknown"
 	ChargeAttemptCreated    ChargeAttemptState = "created"
+	ChargeAttemptResolved   ChargeAttemptState = "resolved"
 	ChargeAttemptFailed     ChargeAttemptState = "failed"
 )
 
@@ -138,6 +140,51 @@ func (s *PostgresStore) MarkChargeAttemptCreated(ctx context.Context, id string,
 		return err
 	}
 	return nil
+}
+
+// RecordChargeAttemptReconciliation stores the PSP's read-only observation for
+// an uncertain attempt. Any known status resolves the POST ambiguity and keeps
+// the order's active-attempt uniqueness guard in place. It does not create a
+// checkout session or authorize fulfillment.
+func (s *PostgresStore) RecordChargeAttemptReconciliation(ctx context.Context, id string, charge WooviCharge, now time.Time) error {
+	if charge.Status != "ACTIVE" && charge.Status != "COMPLETED" && charge.Status != "EXPIRED" {
+		return ErrChargeAttemptState
+	}
+	if charge.Status == "ACTIVE" && (charge.BRCode == "" || !charge.ExpiresAt.After(now)) {
+		return ErrChargeAttemptState
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE psp_charge_attempts
+		SET state='resolved', provider_status=$2, br_code=$3, expires_at=$4, updated_at=$5
+		WHERE attempt_id=$1 AND state IN ('submitting','unknown') AND correlation_id=$6 AND amount_cents=$7`,
+		id, charge.Status, charge.BRCode, charge.ExpiresAt, now, charge.CorrelationID, charge.Value)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("charge attempt %s cannot accept reconciliation for correlationID %q and value %d: %w", id, charge.CorrelationID, charge.Value, ErrChargeAttemptState)
+	}
+	return nil
+}
+
+// ReconcileChargeAttempt performs only GET by the already-reserved correlation
+// ID. A lookup failure leaves the durable attempt unchanged and is never
+// converted into another create-charge POST.
+func ReconcileChargeAttempt(ctx context.Context, store *PostgresStore, client *WooviChargeClient, attempt ChargeAttempt, now time.Time) (WooviCharge, error) {
+	if attempt.ID == "" || attempt.CorrelationID == "" || attempt.AmountCents <= 0 ||
+		(attempt.State != ChargeAttemptSubmitting && attempt.State != ChargeAttemptUnknown) {
+		return WooviCharge{}, ErrChargeAttemptState
+	}
+	charge, err := client.GetCharge(ctx, attempt.CorrelationID)
+	if err != nil {
+		return WooviCharge{}, err
+	}
+	if charge.Value != attempt.AmountCents || charge.CorrelationID != attempt.CorrelationID {
+		return WooviCharge{}, errors.New("woovi lookup did not match reserved amount and correlationID")
+	}
+	if err := store.RecordChargeAttemptReconciliation(ctx, attempt.ID, charge, now); err != nil {
+		return WooviCharge{}, err
+	}
+	return charge, nil
 }
 
 func (s *PostgresStore) ListChargeAttemptsNeedingReconciliation(ctx context.Context, limit int) ([]ChargeAttempt, error) {
