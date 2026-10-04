@@ -104,6 +104,119 @@ func TestPostgresCheckoutLifecycle(t *testing.T) {
 	}
 }
 
+func TestPostgresWebhookResolvesChargeAttemptOutOfOrderWithoutCheckout(t *testing.T) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("set DATABASE_URL to run PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	store, err := OpenPostgres(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	orderID := "attempt-webhook-" + time.Now().Format("150405.000000000")
+	if _, err := store.pool.Exec(ctx, `INSERT INTO demo_orders(order_id, amount_cents) VALUES ($1, $2)`, orderID, 7850); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.pool.Exec(ctx, `DELETE FROM webhook_events WHERE correlation_id IN (SELECT correlation_id FROM psp_charge_attempts WHERE order_id=$1)`, orderID); err != nil {
+			t.Errorf("cleanup webhook events: %v", err)
+		}
+		if _, err := store.pool.Exec(ctx, `DELETE FROM psp_charge_attempts WHERE order_id=$1`, orderID); err != nil {
+			t.Errorf("cleanup charge attempts: %v", err)
+		}
+		if _, err := store.pool.Exec(ctx, `DELETE FROM demo_orders WHERE order_id=$1`, orderID); err != nil {
+			t.Errorf("cleanup demo order: %v", err)
+		}
+	})
+	now := time.Now().UTC()
+	attempt, err := store.ReserveChargeAttempt(ctx, orderID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkChargeAttemptSubmitting(ctx, attempt.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	makeEvent := func(kind, status string) WooviChargeEvent {
+		event := WooviChargeEvent{Event: kind}
+		event.Charge.CorrelationID = attempt.CorrelationID
+		event.Charge.Value = attempt.AmountCents
+		event.Charge.Status = status
+		if status == "COMPLETED" {
+			event.Pix.Status = "CONFIRMED"
+		}
+		return event
+	}
+	apply := func(event WooviChargeEvent, key string) WebhookResult {
+		t.Helper()
+		result, err := store.ApplyChargeEvent(ctx, event, sha256.Sum256([]byte(orderID+key)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	expired := makeEvent("OPENPIX:CHARGE_EXPIRED", "EXPIRED")
+	expiredHash := sha256.Sum256([]byte(orderID + "concurrent-expired"))
+	const deliveries = 12
+	var wg sync.WaitGroup
+	results := make(chan WebhookResult, deliveries)
+	errorsFound := make(chan error, deliveries)
+	for i := 0; i < deliveries; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := store.ApplyChargeEvent(ctx, expired, expiredHash)
+			if err != nil {
+				errorsFound <- err
+				return
+			}
+			results <- result
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errorsFound)
+	for err := range errorsFound {
+		t.Errorf("concurrent webhook delivery: %v", err)
+	}
+	appliedCount, duplicateCount := 0, 0
+	for result := range results {
+		if result.Applied {
+			appliedCount++
+		}
+		if result.Duplicate {
+			duplicateCount++
+		}
+	}
+	if appliedCount != 1 || duplicateCount != deliveries-1 {
+		t.Fatalf("concurrent delivery applied=%d duplicate=%d, want 1/%d", appliedCount, duplicateCount, deliveries-1)
+	}
+	if result := apply(makeEvent("OPENPIX:CHARGE_EXPIRED", "EXPIRED"), "expired-duplicate-payload"); !result.Ignored {
+		t.Fatalf("distinct duplicate state should be ignored: %#v", result)
+	}
+	if result := apply(makeEvent("OPENPIX:CHARGE_COMPLETED", "COMPLETED"), "completed"); !result.Applied {
+		t.Fatalf("COMPLETED must supersede EXPIRED: %#v", result)
+	}
+	if result := apply(makeEvent("OPENPIX:CHARGE_EXPIRED", "EXPIRED"), "late-expired"); !result.Ignored {
+		t.Fatalf("late EXPIRED must not downgrade COMPLETED: %#v", result)
+	}
+	var state, providerStatus string
+	if err := store.pool.QueryRow(ctx, `SELECT state, provider_status FROM psp_charge_attempts WHERE attempt_id=$1`, attempt.ID).Scan(&state, &providerStatus); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(ChargeAttemptResolved) || providerStatus != "COMPLETED" {
+		t.Fatalf("attempt state/status = %s/%s, want resolved/COMPLETED", state, providerStatus)
+	}
+	var checkoutCount int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM checkout_sessions WHERE order_id=$1`, orderID).Scan(&checkoutCount); err != nil {
+		t.Fatal(err)
+	}
+	if checkoutCount != 0 {
+		t.Fatalf("webhook must not issue checkout sessions, count=%d", checkoutCount)
+	}
+}
+
 func TestPostgresConcurrentSessionCreationReusesCheckout(t *testing.T) {
 	url := os.Getenv("DATABASE_URL")
 	if url == "" {

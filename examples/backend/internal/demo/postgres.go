@@ -234,10 +234,63 @@ func (s *PostgresStore) ApplyChargeEvent(ctx context.Context, event WooviChargeE
 		FROM checkout_sessions WHERE correlation_id=$1 FOR UPDATE`, event.Charge.CorrelationID).Scan(
 		&c.id, &c.orderID, &c.correlationID, &c.amount, &status, &c.expiresAt, &c.brCode)
 	if errors.Is(err, pgx.ErrNoRows) {
+		var attemptID string
+		var amount int64
+		var providerStatus string
+		attemptErr := tx.QueryRow(ctx, `SELECT attempt_id, amount_cents, COALESCE(provider_status, '')
+			FROM psp_charge_attempts WHERE correlation_id=$1 FOR UPDATE`, event.Charge.CorrelationID).
+			Scan(&attemptID, &amount, &providerStatus)
+		if attemptErr != nil && !errors.Is(attemptErr, pgx.ErrNoRows) {
+			return WebhookResult{}, attemptErr
+		}
+		if errors.Is(attemptErr, pgx.ErrNoRows) {
+			if err = tx.Commit(ctx); err != nil {
+				return WebhookResult{}, err
+			}
+			return WebhookResult{Ignored: true}, nil
+		}
+		if isChargeStateEvent(event.Event) && (event.Charge.Value != amount ||
+			(event.Event == "OPENPIX:CHARGE_COMPLETED" && (event.Charge.Status != "COMPLETED" || event.Pix.Status != "CONFIRMED")) ||
+			(event.Event == "OPENPIX:CHARGE_EXPIRED" && event.Charge.Status != "EXPIRED")) {
+			if _, err = tx.Exec(ctx, `UPDATE webhook_events SET outcome='rejected_mismatch' WHERE event_hash=$1`, eventHash[:]); err != nil {
+				return WebhookResult{}, err
+			}
+			if err = tx.Commit(ctx); err != nil {
+				return WebhookResult{}, err
+			}
+			return WebhookResult{Rejected: true}, nil
+		}
+		if !isChargeStateEvent(event.Event) {
+			if _, err = tx.Exec(ctx, `UPDATE webhook_events SET outcome='ignored' WHERE event_hash=$1`, eventHash[:]); err != nil {
+				return WebhookResult{}, err
+			}
+			if err = tx.Commit(ctx); err != nil {
+				return WebhookResult{}, err
+			}
+			return WebhookResult{Ignored: true}, nil
+		}
+		observed := event.Charge.Status
+		if _, err = tx.Exec(ctx, `UPDATE psp_charge_attempts
+			SET state='resolved', provider_status=CASE
+				WHEN provider_status='COMPLETED' OR $2='COMPLETED' THEN 'COMPLETED'
+				WHEN provider_status='EXPIRED' OR $2='EXPIRED' THEN 'EXPIRED'
+				ELSE 'ACTIVE' END,
+				updated_at=now(), reconcile_lease_token=NULL, reconcile_lease_until=NULL
+			WHERE attempt_id=$1`, attemptID, observed); err != nil {
+			return WebhookResult{}, err
+		}
+		outcome := "applied"
+		applied := true
+		if providerStatus == "COMPLETED" || (providerStatus == "EXPIRED" && observed == "ACTIVE") || providerStatus == observed {
+			outcome, applied = "ignored", false
+		}
+		if _, err = tx.Exec(ctx, `UPDATE webhook_events SET applied=$2, outcome=$3 WHERE event_hash=$1`, eventHash[:], applied, outcome); err != nil {
+			return WebhookResult{}, err
+		}
 		if err = tx.Commit(ctx); err != nil {
 			return WebhookResult{}, err
 		}
-		return WebhookResult{Ignored: true}, nil
+		return WebhookResult{Applied: applied, Ignored: !applied}, nil
 	}
 	if err != nil {
 		return WebhookResult{}, err
