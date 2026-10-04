@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -46,6 +47,42 @@ func main() {
 		webhookVerifier = demo.NewWooviSignatureVerifier(nil, os.Getenv("WOOVI_WEBHOOK_PUBLIC_KEYS_URL"))
 		log.Print("Woovi charge webhook receiver enabled; order creation remains simulator-only")
 	}
+	var reconciliationWorker *demo.ChargeReconciliationWorker
+	if os.Getenv("ENABLE_WOOVI_RECONCILIATION") == "true" {
+		postgresStore, ok := store.(*demo.PostgresStore)
+		if !ok {
+			log.Fatal("ENABLE_WOOVI_RECONCILIATION requires DATABASE_URL and PostgreSQL")
+		}
+		appID := os.Getenv("WOOVI_APP_ID")
+		if appID == "" {
+			log.Fatal("ENABLE_WOOVI_RECONCILIATION requires server-side WOOVI_APP_ID")
+		}
+		client, err := demo.NewWooviChargeClient(appID, os.Getenv("WOOVI_API_BASE_URL"), nil)
+		if err != nil {
+			log.Fatal("invalid Woovi reconciliation client configuration")
+		}
+		interval := 30 * time.Second
+		if raw := os.Getenv("WOOVI_RECONCILIATION_INTERVAL"); raw != "" {
+			interval, err = time.ParseDuration(raw)
+			if err != nil || interval < time.Second || interval > time.Hour {
+				log.Fatal("WOOVI_RECONCILIATION_INTERVAL must be between 1s and 1h")
+			}
+		}
+		batchSize := 25
+		if raw := os.Getenv("WOOVI_RECONCILIATION_BATCH_SIZE"); raw != "" {
+			batchSize, err = strconv.Atoi(raw)
+			if err != nil || batchSize < 1 || batchSize > 500 {
+				log.Fatal("WOOVI_RECONCILIATION_BATCH_SIZE must be between 1 and 500")
+			}
+		}
+		reconciliationWorker, err = demo.NewChargeReconciliationWorker(postgresStore, client, interval, batchSize, time.Now, func(cycle demo.ReconciliationCycle) {
+			log.Printf("woovi_reconciliation claimed=%d resolved=%d failed=%d queue_error=%t", cycle.Claimed, cycle.Resolved, cycle.Failed, cycle.Err != nil)
+		})
+		if err != nil {
+			log.Fatal("invalid Woovi reconciliation worker configuration")
+		}
+		log.Printf("Woovi charge reconciliation enabled (GET-only; interval=%s batch=%d)", interval, batchSize)
+	}
 	server := demo.NewServerWithOptions(store, time.Now, webhookVerifier, demoPayEnabled)
 	if demoPayEnabled {
 		log.Print("WARNING: unauthenticated demo payment route enabled; never expose outside local development")
@@ -61,8 +98,23 @@ func main() {
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
 	}()
+	var workerDone chan struct{}
+	if reconciliationWorker != nil {
+		workerDone = make(chan struct{})
+		go func() {
+			defer close(workerDone)
+			if err := reconciliationWorker.Run(ctx); err != nil {
+				log.Printf("Woovi reconciliation worker stopped: %T", err)
+			}
+		}()
+	}
 	log.Printf("demo merchant backend (simulated PSP) listening on %s", addr)
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+	listenErr := httpServer.ListenAndServe()
+	stop()
+	if workerDone != nil {
+		<-workerDone
+	}
+	if listenErr != nil && listenErr != http.ErrServerClosed {
+		log.Fatal(listenErr)
 	}
 }
