@@ -431,7 +431,7 @@ import (
 type Config struct {
     Server   ServerConfig
     Database DatabaseConfig
-    Valkey   ValkeyConfig
+    Redis    RedisConfig
 }
 
 type ServerConfig struct {
@@ -447,10 +447,10 @@ type DatabaseConfig struct {
     MaxIdleConns int    `envconfig:"DB_MAX_IDLE_CONNS" default:"5"`
 }
 
-type ValkeyConfig struct {
-    Addr     string `envconfig:"VALKEY_ADDR" default:"localhost:6379"`
-    Password string `envconfig:"VALKEY_PASSWORD"`
-    DB       int    `envconfig:"VALKEY_DB" default:"0"`
+type RedisConfig struct {
+    Addr     string `envconfig:"REDIS_ADDR" default:"localhost:6379"`
+    Password string `envconfig:"REDIS_PASSWORD"`
+    DB       int    `envconfig:"REDIS_DB" default:"0"`
 }
 
 // Load loads configuration from environment
