@@ -353,6 +353,14 @@ func TestPostgresChargeCreateCrashWindowsRecoverWithoutDuplicatePost(t *testing.
 	if err := store.pool.QueryRow(ctx, `SELECT state FROM psp_charge_attempts WHERE attempt_id=$1`, beforePost.ID).Scan(&state); err != nil || state != string(ChargeAttemptSubmitting) {
 		t.Fatalf("pre-POST crash state=%q err=%v", state, err)
 	}
+	store.Close()
+	if err := store.RecordChargeAttemptUnknown(ctx, beforePost.ID, "request_failed", now.Add(time.Second)); err == nil {
+		t.Fatal("marking unknown through an unavailable database should fail")
+	}
+	store, err = OpenPostgres(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Cancellation after the fixture has received the POST is ambiguous too:
 	// it is never replayed, and recovery only performs a correlationID GET.
@@ -368,11 +376,44 @@ func TestPostgresChargeCreateCrashWindowsRecoverWithoutDuplicatePost(t *testing.
 		t.Fatal("cancelled in-flight POST must return an uncertain error")
 	}
 	cancelled.State = ChargeAttemptSubmitting
-	if _, err := ReconcileChargeAttempt(ctx, store, client, cancelled, now.Add(2*time.Second)); err == nil {
-		t.Fatal("cancelled POST without an accepted fixture charge must remain unresolved")
+	completedEvent := WooviChargeEvent{Event: "OPENPIX:CHARGE_COMPLETED"}
+	completedEvent.Charge.CorrelationID = cancelled.CorrelationID
+	completedEvent.Charge.Value = cancelled.AmountCents
+	completedEvent.Charge.Status = "COMPLETED"
+	completedEvent.Pix.Status = "CONFIRMED"
+	webhookResult := make(chan struct {
+		result WebhookResult
+		err    error
+	}, 1)
+	unknownResult := make(chan error, 1)
+	var webhookWait sync.WaitGroup
+	webhookWait.Add(2)
+	go func() {
+		defer webhookWait.Done()
+		result, err := store.ApplyChargeEvent(ctx, completedEvent, sha256.Sum256([]byte("cancelled-terminal-"+cancelled.ID)))
+		webhookResult <- struct {
+			result WebhookResult
+			err    error
+		}{result: result, err: err}
+	}()
+	go func() {
+		defer webhookWait.Done()
+		unknownResult <- store.RecordChargeAttemptUnknown(ctx, cancelled.ID, "request_cancelled", now.Add(2*time.Second))
+	}()
+	webhookWait.Wait()
+	webhook := <-webhookResult
+	if webhook.err != nil || !webhook.result.Applied {
+		t.Fatalf("concurrent terminal webhook = %#v, err=%v", webhook.result, webhook.err)
 	}
-	if err := store.pool.QueryRow(ctx, `SELECT state FROM psp_charge_attempts WHERE attempt_id=$1`, cancelled.ID).Scan(&state); err != nil || state != string(ChargeAttemptSubmitting) {
-		t.Fatalf("cancelled POST changed durable state=%q err=%v", state, err)
+	if err := <-unknownResult; err != nil && !errors.Is(err, ErrChargeAttemptState) {
+		t.Fatalf("concurrent mark-unknown error = %v", err)
+	}
+	var providerStatus string
+	if err := store.pool.QueryRow(ctx, `SELECT state, provider_status FROM psp_charge_attempts WHERE attempt_id=$1`, cancelled.ID).Scan(&state, &providerStatus); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(ChargeAttemptResolved) || providerStatus != "COMPLETED" {
+		t.Fatalf("webhook/recovery race ended at %s/%s", state, providerStatus)
 	}
 
 	// Woovi accepts the POST, then the database becomes unavailable before the
@@ -396,8 +437,8 @@ func TestPostgresChargeCreateCrashWindowsRecoverWithoutDuplicatePost(t *testing.
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if postCount != 2 || getCount != 3 {
-		t.Fatalf("POST count=%d GET count=%d, want 2/3", postCount, getCount)
+	if postCount != 2 || getCount != 2 {
+		t.Fatalf("POST count=%d GET count=%d, want 2/2", postCount, getCount)
 	}
 	if err := store.pool.QueryRow(ctx, `SELECT state FROM psp_charge_attempts WHERE attempt_id=$1`, accepted.ID).Scan(&state); err != nil || state != string(ChargeAttemptResolved) {
 		t.Fatalf("recovered attempt state=%q err=%v", state, err)
