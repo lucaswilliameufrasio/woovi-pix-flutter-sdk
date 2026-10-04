@@ -290,8 +290,12 @@ func TestPostgresAmbiguousChargeCanOnlyResolveThroughLookup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ReconcileChargeAttempt(ctx, store, client, attempt, now.Add(3*time.Second)); err == nil {
-		t.Fatal("not-found lookup must remain unresolved")
+	outcomes, err := ReconcilePendingChargeAttempts(ctx, store, client, 20, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outcomes) != 1 || outcomes[0].AttemptID != attempt.ID || outcomes[0].Err == nil || outcomes[0].Charge != nil {
+		t.Fatalf("not-found queue outcome=%#v", outcomes)
 	}
 	var state string
 	if err := store.pool.QueryRow(ctx, `SELECT state FROM psp_charge_attempts WHERE attempt_id=$1`, attempt.ID).Scan(&state); err != nil || state != string(ChargeAttemptUnknown) {

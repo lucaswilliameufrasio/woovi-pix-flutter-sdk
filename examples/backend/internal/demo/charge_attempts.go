@@ -190,6 +190,36 @@ func ReconcileChargeAttempt(ctx context.Context, store *PostgresStore, client *W
 	return charge, nil
 }
 
+type ChargeReconciliationOutcome struct {
+	AttemptID string
+	Charge    *WooviCharge
+	Err       error
+}
+
+// ReconcilePendingChargeAttempts is a bounded, synchronous queue drainer. It
+// deliberately performs only GET requests; per-attempt failures are returned
+// without stopping later work or changing the attempt's durable unknown state.
+// A scheduler can invoke this with a bounded frequency once operations are set.
+func ReconcilePendingChargeAttempts(ctx context.Context, store *PostgresStore, client *WooviChargeClient, limit int, now time.Time) ([]ChargeReconciliationOutcome, error) {
+	attempts, err := store.ListChargeAttemptsNeedingReconciliation(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	outcomes := make([]ChargeReconciliationOutcome, 0, len(attempts))
+	for _, attempt := range attempts {
+		if err := ctx.Err(); err != nil {
+			return outcomes, err
+		}
+		charge, err := ReconcileChargeAttempt(ctx, store, client, attempt, now)
+		outcome := ChargeReconciliationOutcome{AttemptID: attempt.ID, Err: err}
+		if err == nil {
+			outcome.Charge = &charge
+		}
+		outcomes = append(outcomes, outcome)
+	}
+	return outcomes, nil
+}
+
 func (s *PostgresStore) ListChargeAttemptsNeedingReconciliation(ctx context.Context, limit int) ([]ChargeAttempt, error) {
 	if limit < 1 || limit > 500 {
 		return nil, errors.New("limit must be between 1 and 500")
