@@ -119,13 +119,15 @@ func (s *PostgresStore) MarkChargeAttemptCreated(ctx context.Context, id string,
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var expectedCorrelation string
+	var expectedAmount int64
 	var state ChargeAttemptState
-	if err := tx.QueryRow(ctx, `SELECT correlation_id, state FROM psp_charge_attempts WHERE attempt_id=$1 FOR UPDATE`, id).
-		Scan(&expectedCorrelation, &state); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT correlation_id, amount_cents, state FROM psp_charge_attempts WHERE attempt_id=$1 FOR UPDATE`, id).
+		Scan(&expectedCorrelation, &expectedAmount, &state); err != nil {
 		return err
 	}
 	if (state != ChargeAttemptSubmitting && state != ChargeAttemptUnknown) ||
-		charge.CorrelationID != expectedCorrelation || charge.Status != "ACTIVE" || charge.BRCode == "" || !charge.ExpiresAt.After(now) {
+		charge.CorrelationID != expectedCorrelation || charge.Value != expectedAmount ||
+		charge.Status != "ACTIVE" || charge.BRCode == "" || !charge.ExpiresAt.After(now) {
 		return ErrChargeAttemptState
 	}
 	_, err = tx.Exec(ctx, `UPDATE psp_charge_attempts SET state='created', br_code=$2, expires_at=$3, updated_at=$4 WHERE attempt_id=$1`, id, charge.BRCode, charge.ExpiresAt, now)

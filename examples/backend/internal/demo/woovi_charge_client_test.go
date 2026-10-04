@@ -80,8 +80,8 @@ func TestWooviChargeClientDoesNotForwardAppIDOnRedirect(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer target.Close()
-	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Redirect(w, nil, target.URL+"/capture", http.StatusTemporaryRedirect)
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/capture", http.StatusTemporaryRedirect)
 	}))
 	defer redirect.Close()
 	client, err := NewWooviChargeClient(appID, redirect.URL, nil)
@@ -93,5 +93,30 @@ func TestWooviChargeClientDoesNotForwardAppIDOnRedirect(t *testing.T) {
 	}
 	if targetRequests != 0 {
 		t.Fatalf("redirect target received %d requests", targetRequests)
+	}
+}
+
+func TestWooviChargeLookupUsesCorrelationIDAndValidatesResponse(t *testing.T) {
+	const appID = "not-a-real-app-id"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.EscapedPath() != "/api/v1/charge/order%2F42" {
+			t.Errorf("lookup request = %s %s (escaped %s)", r.Method, r.URL.Path, r.URL.EscapedPath())
+		}
+		if r.Header.Get("Authorization") != appID {
+			t.Error("lookup omitted backend AppID")
+		}
+		_, _ = w.Write([]byte(`{"charge":{"correlationID":"order/42","value":2599,"status":"COMPLETED","brCode":"pix-value","expiresDate":"2030-01-01T00:00:00Z"}}`))
+	}))
+	defer server.Close()
+	client, err := NewWooviChargeClient(appID, server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	charge, err := client.GetCharge(context.Background(), "order/42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if charge.CorrelationID != "order/42" || charge.Status != "COMPLETED" || charge.Value != 2599 {
+		t.Fatalf("charge lookup = %#v", charge)
 	}
 }

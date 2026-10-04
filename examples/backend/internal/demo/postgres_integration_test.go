@@ -223,7 +223,7 @@ func TestPostgresChargeAttemptReservationAndAmbiguousRecovery(t *testing.T) {
 	if !found {
 		t.Fatal("unknown attempt missing from reconciliation queue")
 	}
-	charge := WooviCharge{CorrelationID: reserved.CorrelationID, Status: "ACTIVE", BRCode: "pix-fixture", ExpiresAt: now.Add(15 * time.Minute)}
+	charge := WooviCharge{CorrelationID: reserved.CorrelationID, Status: "ACTIVE", Value: reserved.AmountCents, BRCode: "pix-fixture", ExpiresAt: now.Add(15 * time.Minute)}
 	if err := store.MarkChargeAttemptCreated(ctx, reserved.ID, charge, now.Add(20*time.Second)); err != nil {
 		t.Fatal(err)
 	}

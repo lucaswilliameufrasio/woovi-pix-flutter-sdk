@@ -28,6 +28,7 @@ type WooviChargeClient struct {
 type WooviCharge struct {
 	CorrelationID string
 	Status        string
+	Value         int64
 	BRCode        string
 	ExpiresAt     time.Time
 }
@@ -132,5 +133,65 @@ func (c *WooviChargeClient) CreateCharge(ctx context.Context, correlationID stri
 	if decoded.Charge.Status == "" || brCode == "" || err != nil {
 		return WooviCharge{}, errors.New("woovi charge response is missing status, brCode, or expiresDate")
 	}
-	return WooviCharge{CorrelationID: correlationID, Status: decoded.Charge.Status, BRCode: brCode, ExpiresAt: expiresAt.UTC()}, nil
+	return WooviCharge{CorrelationID: correlationID, Status: decoded.Charge.Status, Value: amountCents, BRCode: brCode, ExpiresAt: expiresAt.UTC()}, nil
+}
+
+// GetCharge retrieves one charge by its documented charge ID or correlationID.
+// This read is suitable for reconciling an ambiguous create outcome using the
+// exact correlation ID already committed in the local attempt record.
+func (c *WooviChargeClient) GetCharge(ctx context.Context, correlationID string) (WooviCharge, error) {
+	if correlationID == "" || len(correlationID) > 128 {
+		return WooviCharge{}, errors.New("invalid charge correlationID")
+	}
+	endpoint := *c.base
+	basePath := strings.TrimRight(endpoint.Path, "/") + "/api/v1/charge/"
+	endpoint.Path = basePath + correlationID
+	endpoint.RawPath = basePath + url.PathEscape(correlationID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return WooviCharge{}, fmt.Errorf("build woovi charge lookup request: %w", err)
+	}
+	req.Header.Set("Authorization", c.appID)
+	req.Header.Set("Accept", "application/json")
+	response, err := c.client.Do(req)
+	if err != nil {
+		return WooviCharge{}, fmt.Errorf("woovi charge lookup failed: %w", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return WooviCharge{}, fmt.Errorf("woovi charge lookup returned HTTP %d", response.StatusCode)
+	}
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxWooviResponseBytes+1))
+	if err != nil {
+		return WooviCharge{}, fmt.Errorf("read woovi charge lookup response: %w", err)
+	}
+	if len(responseBody) > maxWooviResponseBytes {
+		return WooviCharge{}, errors.New("woovi charge lookup response exceeds size limit")
+	}
+	var decoded struct {
+		Charge struct {
+			CorrelationID string `json:"correlationID"`
+			Value         int64  `json:"value"`
+			Status        string `json:"status"`
+			BRCode        string `json:"brCode"`
+			ExpiresDate   string `json:"expiresDate"`
+		} `json:"charge"`
+	}
+	if err := json.Unmarshal(responseBody, &decoded); err != nil {
+		return WooviCharge{}, fmt.Errorf("decode woovi charge lookup response: %w", err)
+	}
+	if decoded.Charge.CorrelationID != correlationID || decoded.Charge.Status == "" {
+		return WooviCharge{}, errors.New("woovi charge lookup returned a mismatched or incomplete charge")
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, decoded.Charge.ExpiresDate)
+	if err != nil {
+		return WooviCharge{}, errors.New("woovi charge lookup returned an invalid expiresDate")
+	}
+	return WooviCharge{
+		CorrelationID: decoded.Charge.CorrelationID,
+		Status:        decoded.Charge.Status,
+		Value:         decoded.Charge.Value,
+		BRCode:        decoded.Charge.BRCode,
+		ExpiresAt:     expiresAt.UTC(),
+	}, nil
 }
