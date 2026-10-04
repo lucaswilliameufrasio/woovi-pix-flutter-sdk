@@ -3,10 +3,12 @@ package demo
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -231,6 +233,139 @@ func TestPostgresWebhookResolvesChargeAttemptOutOfOrderWithoutCheckout(t *testin
 	}
 	if checkoutCount != 0 {
 		t.Fatalf("webhook must not issue checkout sessions, count=%d", checkoutCount)
+	}
+}
+
+func TestPostgresChargeCreateCrashWindowsRecoverWithoutDuplicatePost(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("set DATABASE_URL to run PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	store, err := OpenPostgres(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orderBeforePost := "crash-before-post-" + time.Now().Format("150405.000000000")
+	orderAfterAcceptance := "crash-after-accept-" + time.Now().Format("150405.000000000")
+	for _, orderID := range []string{orderBeforePost, orderAfterAcceptance} {
+		if _, err := store.pool.Exec(ctx, `INSERT INTO demo_orders(order_id, amount_cents) VALUES ($1, $2)`, orderID, 6981); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, orderID := range []string{orderBeforePost, orderAfterAcceptance} {
+			if _, err := store.pool.Exec(ctx, `DELETE FROM webhook_events WHERE correlation_id IN (SELECT correlation_id FROM psp_charge_attempts WHERE order_id=$1)`, orderID); err != nil {
+				t.Errorf("cleanup webhook events: %v", err)
+			}
+			if _, err := store.pool.Exec(ctx, `DELETE FROM psp_charge_attempts WHERE order_id=$1`, orderID); err != nil {
+				t.Errorf("cleanup charge attempts: %v", err)
+			}
+			if _, err := store.pool.Exec(ctx, `DELETE FROM demo_orders WHERE order_id=$1`, orderID); err != nil {
+				t.Errorf("cleanup demo order: %v", err)
+			}
+		}
+		store.Close()
+	})
+
+	now := time.Now().UTC()
+	beforePost, err := store.ReserveChargeAttempt(ctx, orderBeforePost, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkChargeAttemptSubmitting(ctx, beforePost.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := store.ReserveChargeAttempt(ctx, orderAfterAcceptance, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkChargeAttemptSubmitting(ctx, accepted.ID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	charges := make(map[string]int64)
+	postCount, getCount := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodPost:
+			postCount++
+			var request struct {
+				CorrelationID string `json:"correlationID"`
+				Value         int64  `json:"value"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("decode fixture create request: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			charges[request.CorrelationID] = request.Value
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"charge":{"correlationID":"` + request.CorrelationID + `","status":"ACTIVE","brCode":"fixture-pix","expiresDate":"` + now.Add(15*time.Minute).Format(time.RFC3339) + `"}}`))
+		case http.MethodGet:
+			getCount++
+			correlationID := r.URL.Path[len("/api/v1/charge/"):]
+			value, exists := charges[correlationID]
+			if !exists {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"charge":{"correlationID":"` + correlationID + `","value":` + strconv.FormatInt(value, 10) + `,"status":"ACTIVE","brCode":"fixture-pix","expiresDate":"` + now.Add(15*time.Minute).Format(time.RFC3339) + `"}}`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+	client, err := NewWooviChargeClient("fixture-app-id", server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate process loss after durable submitting but before sending POST.
+	store.Close()
+	store, err = OpenPostgres(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforePost.State = ChargeAttemptSubmitting
+	if _, err := ReconcileChargeAttempt(ctx, store, client, beforePost, now.Add(time.Second)); err == nil {
+		t.Fatal("lookup for a request never sent must remain unresolved")
+	}
+	var state string
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM psp_charge_attempts WHERE attempt_id=$1`, beforePost.ID).Scan(&state); err != nil || state != string(ChargeAttemptSubmitting) {
+		t.Fatalf("pre-POST crash state=%q err=%v", state, err)
+	}
+
+	// Woovi accepts the POST, then the database becomes unavailable before the
+	// response can be persisted. Recovery is GET-only with the same correlationID.
+	createdCharge, err := client.CreateCharge(ctx, accepted.CorrelationID, accepted.AmountCents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	if err := store.MarkChargeAttemptCreated(ctx, accepted.ID, createdCharge, now.Add(2*time.Second)); err == nil {
+		t.Fatal("persisting PSP response through a closed database should fail")
+	}
+	store, err = OpenPostgres(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted.State = ChargeAttemptSubmitting
+	recovered, err := ReconcileChargeAttempt(ctx, store, client, accepted, now.Add(3*time.Second))
+	if err != nil || recovered.Status != "ACTIVE" {
+		t.Fatalf("GET recovery = %#v, err=%v", recovered, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if postCount != 1 || getCount != 2 {
+		t.Fatalf("POST count=%d GET count=%d, want 1/2", postCount, getCount)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM psp_charge_attempts WHERE attempt_id=$1`, accepted.ID).Scan(&state); err != nil || state != string(ChargeAttemptResolved) {
+		t.Fatalf("recovered attempt state=%q err=%v", state, err)
 	}
 }
 
