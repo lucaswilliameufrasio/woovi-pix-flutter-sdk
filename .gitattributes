@@ -1,3 +1,5 @@
+*.bat text eol=crlf
+
 # Preserve catalog-managed skill files exactly as installed by npx skills.
 .agents/skills/flutter-add-integration-test/** -whitespace
 .agents/skills/flutter-add-widget-test/** -whitespace
