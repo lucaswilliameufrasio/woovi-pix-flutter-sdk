@@ -67,7 +67,7 @@ func TestPostgresReconciliationWorkerRunsBoundedGETOnlyCycles(t *testing.T) {
 		t.Fatal(err)
 	}
 	cycleResults := make(chan ReconciliationCycle, 1)
-	worker, err := NewChargeReconciliationWorker(store, client, 10*time.Millisecond, 1, time.Now, func(cycle ReconciliationCycle) {
+	worker, err := NewChargeReconciliationWorker(store, client, 10*time.Millisecond, 1, DefaultReconciliationRetryPolicy(), time.Now, func(cycle ReconciliationCycle) {
 		select {
 		case cycleResults <- cycle:
 		default:

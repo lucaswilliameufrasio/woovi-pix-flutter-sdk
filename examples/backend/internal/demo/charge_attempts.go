@@ -268,7 +268,10 @@ type ChargeReconciliationOutcome struct {
 // deliberately performs only GET requests; per-attempt failures are returned
 // without stopping later work or changing the attempt's durable unknown state.
 // A scheduler can invoke this with a bounded frequency once operations are set.
-func ReconcilePendingChargeAttempts(ctx context.Context, store *PostgresStore, client *WooviChargeClient, limit int, now time.Time) ([]ChargeReconciliationOutcome, error) {
+func ReconcilePendingChargeAttempts(ctx context.Context, store *PostgresStore, client *WooviChargeClient, limit int, now time.Time, retryPolicy ReconciliationRetryPolicy) ([]ChargeReconciliationOutcome, error) {
+	if err := retryPolicy.validate(); err != nil {
+		return nil, err
+	}
 	workerToken, err := randomHex(16)
 	if err != nil {
 		return nil, err
@@ -284,7 +287,7 @@ func ReconcilePendingChargeAttempts(ctx context.Context, store *PostgresStore, c
 		}
 		charge, err := ReconcileChargeAttempt(ctx, store, client, attempt, now)
 		if err != nil {
-			retryErr := store.ScheduleChargeAttemptReconciliationRetry(ctx, attempt.ID, attempt.LeaseToken, "reconciliation_failed", now)
+			retryErr := store.ScheduleChargeAttemptReconciliationRetry(ctx, attempt.ID, attempt.LeaseToken, "reconciliation_failed", now, retryPolicy)
 			if retryErr != nil {
 				err = errors.Join(err, retryErr)
 			}
@@ -343,16 +346,21 @@ func (s *PostgresStore) ClaimChargeAttemptsForReconciliation(ctx context.Context
 	return attempts, nil
 }
 
-func (s *PostgresStore) ScheduleChargeAttemptReconciliationRetry(ctx context.Context, id, leaseToken, safeErrorCode string, now time.Time) error {
+func (s *PostgresStore) ScheduleChargeAttemptReconciliationRetry(ctx context.Context, id, leaseToken, safeErrorCode string, now time.Time, policy ReconciliationRetryPolicy) error {
 	if id == "" || leaseToken == "" || len(safeErrorCode) == 0 || len(safeErrorCode) > 64 {
 		return errors.New("invalid reconciliation retry parameters")
 	}
+	if err := policy.validate(); err != nil {
+		return err
+	}
 	result, err := s.pool.Exec(ctx, `UPDATE psp_charge_attempts
 		SET reconcile_attempts=reconcile_attempts+1,
-		    next_reconcile_at=$3::timestamptz + (LEAST(3600, (5 * power(2, LEAST(reconcile_attempts, 10)))::int) * INTERVAL '1 second'),
+		    next_reconcile_at=$3::timestamptz + GREATEST(1, round(LEAST($6::double precision,
+		      $5::double precision * power(2, LEAST(reconcile_attempts, 10))) *
+		      (1 + ((random() * 2 - 1) * $7::double precision))))::bigint * INTERVAL '1 millisecond',
 		    last_reconcile_error=$4, reconcile_lease_token=NULL, reconcile_lease_until=NULL, updated_at=$3
 		WHERE attempt_id=$1 AND state IN ('submitting','unknown') AND reconcile_lease_token=$2`,
-		id, leaseToken, now, safeErrorCode)
+		id, leaseToken, now, safeErrorCode, policy.BaseDelay.Milliseconds(), policy.MaxDelay.Milliseconds(), policy.JitterFraction)
 	if err != nil {
 		return err
 	}

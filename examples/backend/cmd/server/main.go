@@ -75,7 +75,26 @@ func main() {
 				log.Fatal("WOOVI_RECONCILIATION_BATCH_SIZE must be between 1 and 500")
 			}
 		}
-		reconciliationWorker, err = demo.NewChargeReconciliationWorker(postgresStore, client, interval, batchSize, time.Now, func(cycle demo.ReconciliationCycle) {
+		retryPolicy := demo.DefaultReconciliationRetryPolicy()
+		if raw := os.Getenv("WOOVI_RECONCILIATION_RETRY_BASE"); raw != "" {
+			retryPolicy.BaseDelay, err = time.ParseDuration(raw)
+			if err != nil {
+				log.Fatal("invalid WOOVI_RECONCILIATION_RETRY_BASE")
+			}
+		}
+		if raw := os.Getenv("WOOVI_RECONCILIATION_RETRY_MAX"); raw != "" {
+			retryPolicy.MaxDelay, err = time.ParseDuration(raw)
+			if err != nil {
+				log.Fatal("invalid WOOVI_RECONCILIATION_RETRY_MAX")
+			}
+		}
+		if raw := os.Getenv("WOOVI_RECONCILIATION_RETRY_JITTER"); raw != "" {
+			retryPolicy.JitterFraction, err = strconv.ParseFloat(raw, 64)
+			if err != nil {
+				log.Fatal("invalid WOOVI_RECONCILIATION_RETRY_JITTER")
+			}
+		}
+		reconciliationWorker, err = demo.NewChargeReconciliationWorker(postgresStore, client, interval, batchSize, retryPolicy, time.Now, func(cycle demo.ReconciliationCycle) {
 			log.Printf("woovi_reconciliation claimed=%d resolved=%d failed=%d queue_error=%t", cycle.Claimed, cycle.Resolved, cycle.Failed, cycle.Err != nil)
 		})
 		if err != nil {

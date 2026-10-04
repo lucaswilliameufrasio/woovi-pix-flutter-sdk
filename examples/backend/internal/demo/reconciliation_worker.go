@@ -23,19 +23,20 @@ type ChargeReconciliationWorker struct {
 	client   *WooviChargeClient
 	interval time.Duration
 	limit    int
+	retry    ReconciliationRetryPolicy
 	clock    func() time.Time
 	onCycle  func(ReconciliationCycle)
 }
 
-func NewChargeReconciliationWorker(store *PostgresStore, client *WooviChargeClient, interval time.Duration, limit int, clock func() time.Time, onCycle func(ReconciliationCycle)) (*ChargeReconciliationWorker, error) {
-	if store == nil || client == nil || interval <= 0 || limit < 1 || limit > 500 {
+func NewChargeReconciliationWorker(store *PostgresStore, client *WooviChargeClient, interval time.Duration, limit int, retry ReconciliationRetryPolicy, clock func() time.Time, onCycle func(ReconciliationCycle)) (*ChargeReconciliationWorker, error) {
+	if store == nil || client == nil || interval <= 0 || limit < 1 || limit > 500 || retry.validate() != nil {
 		return nil, errors.New("invalid reconciliation worker configuration")
 	}
 	if clock == nil {
 		clock = time.Now
 	}
 	return &ChargeReconciliationWorker{
-		store: store, client: client, interval: interval, limit: limit, clock: clock, onCycle: onCycle,
+		store: store, client: client, interval: interval, limit: limit, retry: retry, clock: clock, onCycle: onCycle,
 	}, nil
 }
 
@@ -50,7 +51,7 @@ func (w *ChargeReconciliationWorker) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			outcomes, err := ReconcilePendingChargeAttempts(ctx, w.store, w.client, w.limit, w.clock().UTC())
+			outcomes, err := ReconcilePendingChargeAttempts(ctx, w.store, w.client, w.limit, w.clock().UTC(), w.retry)
 			cycle := ReconciliationCycle{Claimed: len(outcomes), Err: err}
 			for _, outcome := range outcomes {
 				if outcome.Err != nil {
