@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -25,30 +24,29 @@ const (
 )
 
 type checkout struct {
-	id          string
-	accessToken string
-	tokenHash   [32]byte
-	orderID     string
-	amount      int64
-	status      Status
-	expiresAt   time.Time
-	brCode      string
+	id        string
+	tokenHash [32]byte
+	orderID   string
+	amount    int64
+	status    Status
+	expiresAt time.Time
+	brCode    string
 }
 
 type Server struct {
-	mu       sync.Mutex
-	byID     map[string]*checkout
-	byOrder  map[string]string
-	byToken  map[[32]byte]string
-	orders   map[string]int64
+	store    CheckoutStore
 	clockNow func() time.Time
 }
 
 func NewServer() *Server {
-	return &Server{
-		byID: map[string]*checkout{}, byOrder: map[string]string{}, byToken: map[[32]byte]string{},
-		orders: map[string]int64{"demo-order-1": 2599}, clockNow: time.Now,
+	return NewServerWithStore(NewMemoryStore(), time.Now)
+}
+
+func NewServerWithStore(store CheckoutStore, clock func() time.Time) *Server {
+	if clock == nil {
+		clock = time.Now
 	}
+	return &Server{store: store, clockNow: clock}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -70,40 +68,20 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	amount, exists := s.orders[request.OrderID]
-	if !exists {
+	c, token, created, err := s.store.Create(r.Context(), request.OrderID, s.clockNow())
+	if errors.Is(err, ErrOrderNotFound) {
 		writeError(w, http.StatusNotFound, "order_not_found")
 		return
 	}
-	if id := s.byOrder[request.OrderID]; id != "" {
-		if old := s.byID[id]; old != nil && old.status == Pending && s.clockNow().Before(old.expiresAt) {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"checkout_id": old.id, "access_token": old.accessToken, "status": old.status,
-				"amount_cents": old.amount, "currency": "BRL",
-				"expires_at": old.expiresAt.UTC().Format(time.RFC3339), "pix_copy_paste": old.brCode,
-			})
-			return
-		}
-	}
-	id, err := randomHex(16)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error")
 		return
 	}
-	token, err := randomHex(32)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error")
-		return
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
 	}
-	c := &checkout{id: id, accessToken: token, tokenHash: sha256.Sum256([]byte(token)), orderID: request.OrderID, amount: amount, status: Pending,
-		expiresAt: s.clockNow().Add(15 * time.Minute), brCode: "000201-DEMO-PIX-" + id}
-	s.byID[id], s.byOrder[request.OrderID], s.byToken[c.tokenHash] = c, id, id
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"checkout_id": c.id, "access_token": token, "status": c.status, "amount_cents": c.amount,
-		"currency": "BRL", "expires_at": c.expiresAt.UTC().Format(time.RFC3339), "pix_copy_paste": c.brCode,
-	})
+	writeSessionJSON(w, status, c, token)
 }
 
 func (s *Server) getStatus(w http.ResponseWriter, r *http.Request) {
@@ -113,38 +91,29 @@ func (s *Server) getStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tokenHash := sha256.Sum256([]byte(provided))
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id, ok := s.byToken[tokenHash]
-	c := s.byID[id]
-	if !ok || c == nil || c.id != r.PathValue("id") || c.tokenHash != tokenHash {
+	c, err := s.store.Status(r.Context(), r.PathValue("id"), tokenHash, s.clockNow())
+	if errors.Is(err, ErrCheckoutNotFound) {
 		writeError(w, http.StatusNotFound, "checkout_not_found")
 		return
 	}
-	s.expire(c)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": c.status, "expires_at": c.expiresAt.UTC().Format(time.RFC3339)})
 }
 
 func (s *Server) simulatePaid(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c := s.byID[r.PathValue("id")]
-	if c == nil {
+	c, err := s.store.SimulatePaid(r.Context(), r.PathValue("id"), s.clockNow())
+	if errors.Is(err, ErrCheckoutNotFound) {
 		writeError(w, http.StatusNotFound, "checkout_not_found")
 		return
 	}
-	// Idempotent simulator action. A tardy payment remains a backend policy question;
-	// this deliberately simple demo does not pretend to implement refunds/reconciliation.
-	if c.status == Pending {
-		c.status = Paid
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error")
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": string(c.status)})
-}
-
-func (s *Server) expire(c *checkout) {
-	if c.status == Pending && !s.clockNow().Before(c.expiresAt) {
-		c.status = Expired
-	}
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
@@ -170,6 +139,13 @@ func randomHex(bytes int) (string, error) {
 
 func writeError(w http.ResponseWriter, status int, code string) {
 	writeJSON(w, status, map[string]string{"error": code})
+}
+
+func writeSessionJSON(w http.ResponseWriter, status int, c *checkout, token string) {
+	writeJSON(w, status, map[string]any{
+		"checkout_id": c.id, "access_token": token, "status": c.status, "amount_cents": c.amount,
+		"currency": "BRL", "expires_at": c.expiresAt.UTC().Format(time.RFC3339), "pix_copy_paste": c.brCode,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

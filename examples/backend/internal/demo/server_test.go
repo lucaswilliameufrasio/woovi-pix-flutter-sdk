@@ -35,8 +35,9 @@ func TestCheckoutSessionIsScopedAndIdempotentInDemo(t *testing.T) {
 	if err := json.Unmarshal(second.Body.Bytes(), &recovered); err != nil {
 		t.Fatal(err)
 	}
-	if recovered["checkout_id"] != id || recovered["access_token"] != token {
-		t.Fatal("idempotent recovery changed checkout identity or token")
+	newToken, ok := recovered["access_token"].(string)
+	if recovered["checkout_id"] != id || !ok || newToken == token {
+		t.Fatal("idempotent recovery must keep checkout and issue a new bearer token")
 	}
 
 	wrongCheckout := httptest.NewRequest(http.MethodGet, "/v1/checkout-sessions/not-the-id", nil)
@@ -46,9 +47,16 @@ func TestCheckoutSessionIsScopedAndIdempotentInDemo(t *testing.T) {
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("cross-checkout status = %d", response.Code)
 	}
+	oldTokenReq := httptest.NewRequest(http.MethodGet, "/v1/checkout-sessions/"+id, nil)
+	oldTokenReq.Header.Set("Authorization", "Bearer "+token)
+	oldTokenRes := httptest.NewRecorder()
+	h.ServeHTTP(oldTokenRes, oldTokenReq)
+	if oldTokenRes.Code != http.StatusOK {
+		t.Fatalf("parallel session bearer should remain valid: %d", oldTokenRes.Code)
+	}
 
 	statusReq := httptest.NewRequest(http.MethodGet, "/v1/checkout-sessions/"+id, nil)
-	statusReq.Header.Set("Authorization", "Bearer "+token)
+	statusReq.Header.Set("Authorization", "Bearer "+newToken)
 	statusRes := httptest.NewRecorder()
 	h.ServeHTTP(statusRes, statusReq)
 	if statusRes.Code != http.StatusOK {
@@ -62,7 +70,7 @@ func TestCheckoutSessionIsScopedAndIdempotentInDemo(t *testing.T) {
 		t.Fatalf("simulated pay = %d", payRes.Code)
 	}
 	statusReq = httptest.NewRequest(http.MethodGet, "/v1/checkout-sessions/"+id, nil)
-	statusReq.Header.Set("Authorization", "Bearer "+token)
+	statusReq.Header.Set("Authorization", "Bearer "+newToken)
 	statusRes = httptest.NewRecorder()
 	h.ServeHTTP(statusRes, statusReq)
 	if !bytes.Contains(statusRes.Body.Bytes(), []byte(`"status":"paid"`)) {

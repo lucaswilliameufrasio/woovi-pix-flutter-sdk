@@ -58,8 +58,12 @@ class CheckoutController extends ChangeNotifier with WidgetsBindingObserver {
     try {
       final latest = await _transport.fetchStatus(session);
       if (_disposed) return;
-      if (!(_status == CheckoutStatus.paid &&
-          latest.status != CheckoutStatus.paid)) {
+      final canTransition = switch (_status) {
+        CheckoutStatus.pending => true,
+        CheckoutStatus.expired => latest.status == CheckoutStatus.paid,
+        CheckoutStatus.paid => false,
+      };
+      if (canTransition) {
         _status = latest.status;
       }
       _transportError = null;
