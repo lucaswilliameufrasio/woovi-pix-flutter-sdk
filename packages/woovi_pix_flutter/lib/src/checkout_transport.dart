@@ -28,8 +28,24 @@ class HttpCheckoutTransport implements CheckoutTransport {
       'Accept': 'application/json'
     }).timeout(const Duration(seconds: 10));
     if (response.statusCode != 200) {
+      Object? decodedError;
+      try {
+        decodedError = jsonDecode(response.body);
+      } on FormatException {
+        decodedError = null;
+      }
+      final body = decodedError is Map<String, Object?> ? decodedError : null;
+      final extra = body?['extra'];
       throw CheckoutTransportException(
-          'Status request failed (${response.statusCode})');
+        statusCode: response.statusCode,
+        errorCode: body?['error_code'] is String
+            ? body!['error_code']! as String
+            : 'UNEXPECTED_ERROR',
+        message: body?['message'] is String
+            ? body!['message']! as String
+            : 'Falha ao consultar o checkout',
+        extra: extra is Map<String, Object?> ? extra : null,
+      );
     }
     final decoded = jsonDecode(response.body);
     if (decoded is! Map<String, Object?>) {
@@ -40,8 +56,17 @@ class HttpCheckoutTransport implements CheckoutTransport {
 }
 
 class CheckoutTransportException implements Exception {
-  const CheckoutTransportException(this.message);
+  const CheckoutTransportException({
+    required this.statusCode,
+    required this.errorCode,
+    required this.message,
+    this.extra,
+  });
+
+  final int statusCode;
+  final String errorCode;
   final String message;
+  final Map<String, Object?>? extra;
   @override
-  String toString() => message;
+  String toString() => '$errorCode ($statusCode): $message';
 }

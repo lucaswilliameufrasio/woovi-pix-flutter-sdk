@@ -165,10 +165,19 @@ func (s *PostgresStore) Status(ctx context.Context, id string, tokenHash [32]byt
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	var grantCheckoutID string
+	if err := tx.QueryRow(ctx, `SELECT checkout_id FROM checkout_session_tokens WHERE token_hash=$1 AND expires_at>$2`, tokenHash[:], now).Scan(&grantCheckoutID); errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrCheckoutUnauthorized
+	} else if err != nil {
+		return nil, err
+	}
+	if grantCheckoutID != id {
+		return nil, ErrCheckoutNotFound
+	}
 	c, err := scanCheckout(tx.QueryRow(ctx, `SELECT c.checkout_id, t.token_hash, c.order_id, c.correlation_id, c.amount_cents, c.status, c.expires_at, c.br_code
 		FROM checkout_sessions c JOIN checkout_session_tokens t ON t.checkout_id=c.checkout_id
 		WHERE c.checkout_id=$1 AND t.token_hash=$2 AND t.expires_at>$3 FOR UPDATE OF c`, id, tokenHash[:], now))
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && c.tokenHash != tokenHash) {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrCheckoutNotFound
 	}
 	if err != nil {

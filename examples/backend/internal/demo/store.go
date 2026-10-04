@@ -9,8 +9,9 @@ import (
 )
 
 var (
-	ErrOrderNotFound    = errors.New("order not found")
-	ErrCheckoutNotFound = errors.New("checkout not found")
+	ErrOrderNotFound        = errors.New("order not found")
+	ErrCheckoutNotFound     = errors.New("checkout not found")
+	ErrCheckoutUnauthorized = errors.New("checkout bearer token invalid or expired")
 )
 
 // CheckoutStore persists the merchant-owned order and checkout session data.
@@ -89,7 +90,10 @@ func (s *MemoryStore) Status(_ context.Context, id string, tokenHash [32]byte, n
 	defer s.mu.Unlock()
 	c := s.byID[id]
 	grant, ok := s.tokens[tokenHash]
-	if c == nil || !ok || grant.checkoutID != id || !now.Before(grant.expiresAt) {
+	if !ok || !now.Before(grant.expiresAt) {
+		return nil, ErrCheckoutUnauthorized
+	}
+	if c == nil || grant.checkoutID != id {
 		return nil, ErrCheckoutNotFound
 	}
 	if c.status == Pending && !now.Before(c.expiresAt) {

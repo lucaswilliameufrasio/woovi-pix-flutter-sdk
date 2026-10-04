@@ -47,7 +47,21 @@ class _OrderPageState extends State<OrderPage> {
               body: jsonEncode({'order_id': 'demo-order-1'}))
           .timeout(const Duration(seconds: 10));
       if (response.statusCode != 200 && response.statusCode != 201) {
-        throw StateError('Backend returned ${response.statusCode}');
+        Object? decodedError;
+        try {
+          decodedError = jsonDecode(response.body);
+        } on FormatException {
+          decodedError = null;
+        }
+        final errorBody =
+            decodedError is Map<String, Object?> ? decodedError : null;
+        final errorCode = errorBody?['error_code'] is String
+            ? errorBody!['error_code']! as String
+            : 'UNEXPECTED_ERROR';
+        final message = errorBody?['message'] is String
+            ? errorBody!['message']! as String
+            : 'Não foi possível iniciar o checkout';
+        throw StateError('$errorCode: $message');
       }
       final body = jsonDecode(response.body);
       if (body is! Map<String, Object?>) {
@@ -112,7 +126,7 @@ class _OrderPageState extends State<OrderPage> {
               ),
               const SizedBox(height: 24),
               const Text(
-                  'Para simular o pagamento, envie POST /demo/checkouts/{checkout_id}/pay ao backend local.'),
+                  'Para simular o pagamento, envie POST /v1/demo/checkouts/{checkout_id}/pay ao backend local.'),
             ],
           ],
         ),

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -48,6 +50,12 @@ func TestCheckoutSessionIsScopedAndIdempotentInDemo(t *testing.T) {
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("cross-checkout status = %d", response.Code)
 	}
+	assertAPIError(t, response, http.StatusNotFound, "CHECKOUT_NOT_FOUND", false)
+	invalidTokenRequest := httptest.NewRequest(http.MethodGet, "/v1/checkout-sessions/"+id, nil)
+	invalidTokenRequest.Header.Set("Authorization", "Bearer invalid-token")
+	invalidTokenResponse := httptest.NewRecorder()
+	h.ServeHTTP(invalidTokenResponse, invalidTokenRequest)
+	assertAPIError(t, invalidTokenResponse, http.StatusUnauthorized, "UNAUTHORIZED", false)
 	oldTokenReq := httptest.NewRequest(http.MethodGet, "/v1/checkout-sessions/"+id, nil)
 	oldTokenReq.Header.Set("Authorization", "Bearer "+token)
 	oldTokenRes := httptest.NewRecorder()
@@ -64,7 +72,7 @@ func TestCheckoutSessionIsScopedAndIdempotentInDemo(t *testing.T) {
 		t.Fatalf("status request = %d: %s", statusRes.Code, statusRes.Body.String())
 	}
 
-	payReq := httptest.NewRequest(http.MethodPost, "/demo/checkouts/"+id+"/pay", nil)
+	payReq := httptest.NewRequest(http.MethodPost, "/v1/demo/checkouts/"+id+"/pay", nil)
 	payRes := httptest.NewRecorder()
 	h.ServeHTTP(payRes, payReq)
 	if payRes.Code != http.StatusOK {
@@ -84,29 +92,107 @@ func TestCreateRejectsClientControlledAmounts(t *testing.T) {
 	res := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/checkout-sessions", bytes.NewBufferString(`{"order_id":"demo-order-1","amount_cents":1}`))
 	s.Handler().ServeHTTP(res, req)
-	if res.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", res.Code)
+	if res.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", res.Code)
 	}
+	assertAPIError(t, res, http.StatusUnprocessableEntity, "INVALID_PARAMS", true)
+}
+
+func TestAPIErrorHouseContract(t *testing.T) {
+	handler := NewServer().Handler()
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus int
+		wantCode   string
+		validation bool
+	}{
+		{name: "malformed json", body: `{"order_id":`, wantStatus: http.StatusBadRequest, wantCode: "MALFORMED_REQUEST"},
+		{name: "semantic validation", body: `{"order_id":""}`, wantStatus: http.StatusUnprocessableEntity, wantCode: "INVALID_PARAMS", validation: true},
+		{name: "unknown request field", body: `{"order_id":"demo-order-1","amount_cents":1}`, wantStatus: http.StatusUnprocessableEntity, wantCode: "INVALID_PARAMS", validation: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, apiCheckoutSessionsPath, bytes.NewBufferString(test.body))
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			assertAPIError(t, response, test.wantStatus, test.wantCode, test.validation)
+		})
+	}
+
+	unauthorizedRequest := httptest.NewRequest(http.MethodGet, "/v1/checkout-sessions/id", nil)
+	unauthorizedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(unauthorizedResponse, unauthorizedRequest)
+	assertAPIError(t, unauthorizedResponse, http.StatusUnauthorized, "UNAUTHORIZED", false)
+
+	tooLarge := strings.Repeat(" ", maxBodyBytes+1)
+	largeRequest := httptest.NewRequest(http.MethodPost, apiCheckoutSessionsPath, strings.NewReader(tooLarge))
+	largeResponse := httptest.NewRecorder()
+	handler.ServeHTTP(largeResponse, largeRequest)
+	assertAPIError(t, largeResponse, http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE", false)
 }
 
 func TestDemoPaymentRouteIsDisabledByDefault(t *testing.T) {
 	handler := NewServerWithStore(NewMemoryStore(), time.Now).Handler()
-	request := httptest.NewRequest(http.MethodPost, "/demo/checkouts/does-not-matter/pay", nil)
+	request := httptest.NewRequest(http.MethodPost, "/v1/demo/checkouts/does-not-matter/pay", nil)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("demo payment route status = %d, want 404 when disabled", response.Code)
 	}
+	assertAPIError(t, response, http.StatusNotFound, "RESOURCE_NOT_FOUND", false)
 }
 
 type testWebhookVerifier struct {
 	valid bool
 	raw   []byte
+	err   error
 }
 
 func (v *testWebhookVerifier) Verify(_ context.Context, raw []byte, _ string) (bool, error) {
 	v.raw = append([]byte(nil), raw...)
-	return v.valid, nil
+	return v.valid, v.err
+}
+
+func TestWebhookDependencyFailureUsesGatewayErrorContract(t *testing.T) {
+	verifier := &testWebhookVerifier{err: errors.New("private upstream details")}
+	handler := NewServerWithStoreAndWebhookVerifier(NewMemoryStore(), time.Now, verifier).Handler()
+	response := postWebhook(handler, []byte(`{}`))
+	assertAPIError(t, response, http.StatusBadGateway, "DEPENDENCY_UNAVAILABLE", false)
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(response.Body.Bytes(), []byte("private upstream details")) {
+		t.Fatalf("internal provider error leaked: %s", response.Body.String())
+	}
+	extra := body["extra"].(map[string]any)
+	if extra["provider_code"] != "WEBHOOK_KEY_LOOKUP_FAILED" {
+		t.Fatalf("provider code must be classified, got %#v", extra)
+	}
+}
+
+type failingCreateStore struct {
+	CheckoutStore
+	err error
+}
+
+func (s failingCreateStore) Create(context.Context, string, time.Time) (*checkout, string, bool, error) {
+	return nil, "", false, s.err
+}
+
+func TestUnexpectedErrorDoesNotExposeInternalDetails(t *testing.T) {
+	handler := NewServerWithStore(failingCreateStore{
+		CheckoutStore: NewMemoryStore(),
+		err:           errors.New("database password and stack details"),
+	}, time.Now).Handler()
+	request := httptest.NewRequest(http.MethodPost, apiCheckoutSessionsPath, bytes.NewBufferString(`{"order_id":"demo-order-1"}`))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertAPIError(t, response, http.StatusInternalServerError, "UNEXPECTED_ERROR", false)
+	if bytes.Contains(response.Body.Bytes(), []byte("database password")) {
+		t.Fatalf("internal error leaked to client: %s", response.Body.String())
+	}
 }
 
 func TestSignedWebhookAppliesIdempotentlyAndPaidIsTerminal(t *testing.T) {
@@ -155,7 +241,7 @@ func TestSignedWebhookAppliesIdempotentlyAndPaidIsTerminal(t *testing.T) {
 
 func postWebhook(handler http.Handler, body []byte) *httptest.ResponseRecorder {
 	response := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/webhooks/woovi", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, apiWebhookWooviPath, bytes.NewReader(body))
 	req.Header.Set("x-webhook-signature", "test-signature")
 	handler.ServeHTTP(response, req)
 	return response
@@ -167,4 +253,35 @@ func createCheckout(t *testing.T, h http.Handler, orderID string) *httptest.Resp
 	req := httptest.NewRequest(http.MethodPost, "/v1/checkout-sessions", bytes.NewBufferString(`{"order_id":"`+orderID+`"}`))
 	h.ServeHTTP(res, req)
 	return res
+}
+
+func assertAPIError(t *testing.T, response *httptest.ResponseRecorder, status int, code string, withValidation bool) {
+	t.Helper()
+	if response.Code != status {
+		t.Fatalf("status=%d, want %d: %s", response.Code, status, response.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("error response is not JSON: %v", err)
+	}
+	if _, ok := body["message"].(string); !ok || body["message"] == "" {
+		t.Fatalf("missing human-readable message: %#v", body)
+	}
+	if body["error_code"] != code {
+		t.Fatalf("error_code=%v, want %s", body["error_code"], code)
+	}
+	if withValidation {
+		extra, ok := body["extra"].(map[string]any)
+		if !ok {
+			t.Fatalf("422 missing extra.validation_errors: %#v", body)
+		}
+		errors, ok := extra["validation_errors"].([]any)
+		if !ok || len(errors) == 0 {
+			t.Fatalf("422 validation_errors empty: %#v", body)
+		}
+		item, ok := errors[0].(map[string]any)
+		if !ok || item["field"] == nil || item["message"] == nil {
+			t.Fatalf("invalid validation error shape: %#v", errors)
+		}
+	}
 }

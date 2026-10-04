@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -14,6 +13,12 @@ import (
 )
 
 const maxBodyBytes = 4096
+
+const (
+	apiCheckoutSessionsPath = "/v1/checkout-sessions"
+	apiWebhookWooviPath     = "/v1/webhooks/woovi"
+	apiDemoPayPath          = "/v1/demo/checkouts/{id}/pay"
+)
 
 type Status string
 
@@ -65,14 +70,19 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("POST /v1/checkout-sessions", s.createSession)
+	mux.HandleFunc("POST "+apiCheckoutSessionsPath, s.createSession)
 	mux.HandleFunc("GET /v1/checkout-sessions/{id}", s.getStatus)
 	if s.allowDemoPay {
-		mux.HandleFunc("POST /demo/checkouts/{id}/pay", s.simulatePaid)
+		mux.HandleFunc("POST "+apiDemoPayPath, s.simulatePaid)
 	}
 	if s.webhookAuth != nil {
-		mux.HandleFunc("POST /webhooks/woovi", s.receiveWooviWebhook)
+		mux.HandleFunc("POST "+apiWebhookWooviPath, s.receiveWooviWebhook)
 	}
+	apiNotFound := func(w http.ResponseWriter, _ *http.Request) { writeAPIError(w, resourceNotFound("resource")) }
+	mux.HandleFunc("/v1/", apiNotFound)
+	mux.HandleFunc("/demo/", apiNotFound)
+	mux.HandleFunc("/webhooks/", apiNotFound)
+	mux.HandleFunc("/", apiNotFound)
 	return securityHeaders(mux)
 }
 
@@ -80,17 +90,21 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		OrderID string `json:"order_id"`
 	}
-	if err := decodeJSON(w, r, &request); err != nil || request.OrderID == "" || len(request.OrderID) > 128 {
-		writeError(w, http.StatusBadRequest, "invalid_request")
+	if err := decodeJSON(w, r, &request); err != nil {
+		writeAPIError(w, decodeAPIError(err))
+		return
+	}
+	if request.OrderID == "" || len(request.OrderID) > 128 {
+		writeAPIError(w, invalidParams("order_id", "deve conter entre 1 e 128 caracteres"))
 		return
 	}
 	c, token, created, err := s.store.Create(r.Context(), request.OrderID, s.clockNow())
 	if errors.Is(err, ErrOrderNotFound) {
-		writeError(w, http.StatusNotFound, "order_not_found")
+		writeAPIError(w, resourceNotFound("order"))
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		writeAPIError(w, unexpectedError())
 		return
 	}
 	status := http.StatusCreated
@@ -103,17 +117,21 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getStatus(w http.ResponseWriter, r *http.Request) {
 	provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if provided == "" || provided == r.Header.Get("Authorization") {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+		writeAPIError(w, unauthorized())
 		return
 	}
 	tokenHash := sha256.Sum256([]byte(provided))
 	c, err := s.store.Status(r.Context(), r.PathValue("id"), tokenHash, s.clockNow())
+	if errors.Is(err, ErrCheckoutUnauthorized) {
+		writeAPIError(w, unauthorized())
+		return
+	}
 	if errors.Is(err, ErrCheckoutNotFound) {
-		writeError(w, http.StatusNotFound, "checkout_not_found")
+		writeAPIError(w, resourceNotFound("checkout"))
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		writeAPIError(w, unexpectedError())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": c.status, "expires_at": c.expiresAt.UTC().Format(time.RFC3339)})
@@ -122,11 +140,11 @@ func (s *Server) getStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) simulatePaid(w http.ResponseWriter, r *http.Request) {
 	c, err := s.store.SimulatePaid(r.Context(), r.PathValue("id"), s.clockNow())
 	if errors.Is(err, ErrCheckoutNotFound) {
-		writeError(w, http.StatusNotFound, "checkout_not_found")
+		writeAPIError(w, resourceNotFound("checkout"))
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		writeAPIError(w, unexpectedError())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": string(c.status)})
@@ -136,30 +154,30 @@ func (s *Server) receiveWooviWebhook(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 	rawBody, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_payload")
+		writeAPIError(w, decodeAPIError(err))
 		return
 	}
 	valid, err := s.webhookAuth.Verify(r.Context(), rawBody, r.Header.Get("x-webhook-signature"))
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "signature_verification_unavailable")
+		writeAPIError(w, dependencyError("DEPENDENCY_UNAVAILABLE", "Não foi possível validar o webhook no momento", "WEBHOOK_KEY_LOOKUP_FAILED"))
 		return
 	}
 	if !valid {
-		writeError(w, http.StatusUnauthorized, "invalid_signature")
+		writeAPIError(w, unauthorized())
 		return
 	}
 	var event WooviChargeEvent
 	if err := json.Unmarshal(rawBody, &event); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_payload")
+		writeAPIError(w, malformedRequest())
 		return
 	}
 	if event.Charge.CorrelationID == "" || len(event.Charge.CorrelationID) > 128 {
-		writeError(w, http.StatusBadRequest, "invalid_payload")
+		writeAPIError(w, invalidParams("charge.correlationID", "deve conter entre 1 e 128 caracteres"))
 		return
 	}
 	result, err := s.store.ApplyChargeEvent(r.Context(), event, sha256.Sum256(rawBody))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "webhook_processing_failed")
+		writeAPIError(w, unexpectedError())
 		return
 	}
 	status := http.StatusOK
@@ -179,7 +197,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
 		return err
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("trailing JSON data")
+		return errMalformedJSON
 	}
 	return nil
 }
@@ -190,10 +208,6 @@ func randomHex(bytes int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
-}
-
-func writeError(w http.ResponseWriter, status int, code string) {
-	writeJSON(w, status, map[string]string{"error": code})
 }
 
 func writeSessionJSON(w http.ResponseWriter, status int, c *checkout, token string) {
