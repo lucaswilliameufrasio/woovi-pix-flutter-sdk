@@ -1,17 +1,9 @@
-# woovi_pix_flutter_example
+# Exemplo Flutter de checkout Pix
 
-A new Flutter project.
+[English (en-US)](README-en-us.md)
 
-## Getting Started
+Aplicativo de demonstração do pacote `woovi_pix_flutter`. Ele se comunica com o servidor Go em `../examples/backend`; nunca recebe o AppID da Woovi.
 
-This project is a starting point for a Flutter application.
+Consulte o [README principal em português](../README.md) para os requisitos, a inicialização do servidor, os fluxos simulado e sandbox, os testes e as instruções Android/iOS.
 
-A few resources to get you started if this is your first Flutter project:
-
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+> Exclusivo para testes locais. O QR simulado é fictício; não pague com banco real. O token de sessão sandbox é incorporado ao aplicativo exemplo: não distribua o APK com esse token nem use esse mecanismo de autenticação em produção.

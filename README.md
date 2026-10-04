@@ -1,24 +1,26 @@
 # Woovi Pix Flutter SDK
 
-A Flutter package and example merchant backend for displaying a Pix checkout. The Flutter app talks only to the merchant backend; Woovi credentials and payment confirmation stay server-side.
+[English (en-US)](README-en-us.md)
 
-> **Example, not production:** the default flow uses a simulated PSP. An explicitly enabled sandbox flow creates test charges at Woovi, never at its production API. No sandbox/live calls have been executed during development. Credentials remain server-side. Production auth and fulfillment must be implemented by the merchant.
+Pacote Flutter e servidor de exemplo do lojista para exibir um checkout Pix. O aplicativo Flutter se comunica somente com o servidor do lojista; as credenciais Woovi e a confirmação do pagamento permanecem no servidor.
 
-## Repository layout
+> **Exemplo, não destinado à produção:** o fluxo padrão usa um provedor de serviços de pagamento (PSP) simulado. O fluxo sandbox, habilitado explicitamente, cria cobranças de teste na Woovi, nunca na API de produção. Nenhuma chamada ao sandbox ou à produção foi executada durante o desenvolvimento. As credenciais permanecem no servidor. O lojista precisa implementar autenticação e liberação do pedido para produção.
 
-- `packages/woovi_pix_flutter`: reusable Flutter package (controller, transport, model and checkout view).
-- `example/`: runnable Flutter demonstration app.
-- `examples/backend`: Go merchant backend, PostgreSQL migrations and local PSP simulator.
+## Estrutura do repositório
 
-## Requirements
+- `packages/woovi_pix_flutter`: pacote Flutter reutilizável com controlador, transporte HTTP, modelo e interface de checkout.
+- `example/`: aplicativo Flutter de demonstração executável.
+- `examples/backend`: servidor Go do lojista, migrações PostgreSQL e simulador local de PSP.
+
+## Requisitos
 
 - Flutter 3.24+ / Dart 3.5+
-- Go 1.27.1 (pinned in `.mise.toml` and `examples/backend/go.mod`)
-- PostgreSQL 18 (image pinned by digest in `examples/backend/docker-compose.yml`)
+- Go 1.27.1 (versão fixada em `.mise.toml` e `examples/backend/go.mod`)
+- PostgreSQL 18 (imagem fixada por resumo criptográfico em `examples/backend/docker-compose.yml`)
 
-## Run the demo
+## Executar a demonstração
 
-Start the isolated local PostgreSQL service and backend (migrations apply on startup):
+Inicie o serviço PostgreSQL local isolado e o servidor (as migrações são aplicadas na inicialização):
 
 ```sh
 cd examples/backend
@@ -28,7 +30,7 @@ PGPORT="$(docker compose -p woovi-pix-flutter-sdk-demo port postgres 5432 | sed 
 DATABASE_URL="postgres://woovi_demo:woovi_demo@127.0.0.1:${PGPORT}/woovi_demo?sslmode=disable" ENABLE_DEMO_PSP=true mise exec -- go run ./cmd/server
 ```
 
-In another terminal:
+Em outro terminal:
 
 ```sh
 cd example
@@ -36,9 +38,9 @@ mise exec -- flutter pub get
 mise exec -- flutter run --dart-define=DEMO_BACKEND=http://10.0.2.2:8080
 ```
 
-The default URL is for the Android emulator. For the iOS simulator use `--dart-define=DEMO_BACKEND=http://127.0.0.1:8080`. This is local development HTTP only.
+A URL padrão é para o emulador Android. No simulador iOS, use `--dart-define=DEMO_BACKEND=http://127.0.0.1:8080`. O uso de HTTP é restrito ao desenvolvimento local.
 
-The app creates a fictional order through the backend, displays the simulated Pix QR payload and polls the checkout status. API endpoints are versioned under `/v1`; JSON bodies use `snake_case` except inbound Woovi webhook payloads, whose field names are dictated by Woovi. With `ENABLE_DEMO_PSP=true`, use `POST /v1/demo/checkouts/{id}/pay` to simulate PSP confirmation. This unauthenticated route is disabled by default, must never be enabled outside local demos, and cannot be enabled together with the webhook receiver. The UI's paid callback is only a presentation signal; merchant fulfillment must read its own order state on the server.
+O aplicativo cria um pedido fictício pelo servidor, exibe o QR Pix simulado e consulta periodicamente o estado do checkout. Os endpoints da API são versionados em `/v1`; os corpos JSON usam `snake_case`, exceto as notificações webhook recebidas da Woovi, cujos nomes de campos são definidos pela Woovi. Com `ENABLE_DEMO_PSP=true`, use `POST /v1/demo/checkouts/{id}/pay` para simular a confirmação do PSP. Essa rota sem autenticação fica desabilitada por padrão, nunca deve ser habilitada fora das demonstrações locais e não pode ser habilitada junto com o receptor de webhook. O callback de pagamento da interface é apenas um sinal de apresentação; a liberação do pedido pelo lojista deve consultar o estado do próprio pedido no servidor.
 
 ## Testar o pagamento simulado
 
@@ -152,17 +154,17 @@ de teste via um túnel público irrestrito; exponha apenas o caminho de webhook.
 Webhooks são verificados pelo backend, e fulfillment comercial continua fora
 do exemplo. Os testes automatizados usam HTTP fixture local, não a Woovi.
 
-## Contrato do backend merchant
+## Contrato do servidor do lojista
 
-`POST /v1/checkout-sessions` is the simulated flow and accepts `order_id`. `POST /v1/merchant/checkout-sessions` requires a configured `MerchantCheckoutAuthorizer`, PostgreSQL and server-side `ChargeCreator`; sandbox mode configures a test-only adapter explicitly. It requires `Idempotency-Key`, derives amount from the authorizer/store and never trusts an amount from Flutter. Matching keys recover the same checkout; key reuse across orders conflicts; new attempts require confirmed EXPIRED. COMPLETED returns `paid` without `pix_copy_paste`. `GET /v1/checkout-sessions/{id}` uses a checkout-scoped bearer token. Errors follow `{ message, error_code, extra? }` with stable codes: malformed JSON 400, semantic validation 422, not-found 404 and generic unexpected errors 500. Network errors are not payment states. Sandbox authentication is not a substitute for merchant auth/ownership validation.
+`POST /v1/checkout-sessions` é o fluxo simulado e recebe `order_id`. `POST /v1/merchant/checkout-sessions` exige um `MerchantCheckoutAuthorizer` configurado, PostgreSQL e um `ChargeCreator` no servidor; o modo sandbox configura explicitamente um adaptador exclusivo para testes. Exige `Idempotency-Key`, obtém o valor do autorizador ou armazenamento e nunca confia em um valor enviado pelo Flutter. Chaves correspondentes recuperam o mesmo checkout; reutilizar a chave entre pedidos gera conflito; novas tentativas exigem `EXPIRED` confirmado. `COMPLETED` retorna `paid` sem `pix_copy_paste`. `GET /v1/checkout-sessions/{id}` usa um token bearer limitado ao checkout. Os erros seguem `{ message, error_code, extra? }` com códigos estáveis: JSON malformado 400, validação semântica 422, recurso não encontrado 404 e erros inesperados genéricos 500. Erros de rede não são estados de pagamento. A autenticação sandbox não substitui autenticação do lojista nem validação de propriedade do pedido.
 
-The backend also contains a `WooviChargeClient` implementing documented charge creation (`POST /api/v1/charge`) and lookup (`GET /api/v1/charge/{id}`, where `id` may be a charge ID or `correlationID`), using `Authorization: <AppID>` and cent values. `SubmitChargeForOrder` orchestrates one durable reservation, the exclusive `reserved` → `submitting` boundary, one POST, and persistence/ambiguity handling; concurrent callers and PSP failures are covered by PostgreSQL + local HTTP-fixture tests. The authenticated merchant checkout adapter binds this orchestration to a durable `Idempotency-Key` and creates the session from the authoritative PSP ledger. PostgreSQL retains ambiguous outcomes as `unknown`; such attempts are never POSTed again. Reconciliation claims use expiring PostgreSQL leases with `SKIP LOCKED`; failed GET lookups schedule bounded exponential backoff with jitter. The optional GET-only worker is disabled by default and uses conservative bounded settings. Keep the AppID server-only.
+O servidor também contém um `WooviChargeClient` que implementa a criação documentada de cobranças (`POST /api/v1/charge`) e a consulta (`GET /api/v1/charge/{id}`, em que `id` pode ser o identificador da cobrança ou `correlationID`), usando `Authorization: <AppID>` e valores em centavos. `SubmitChargeForOrder` coordena uma reserva persistente, a transição exclusiva `reserved` → `submitting`, um único POST e o tratamento de persistência e ambiguidade; chamadas concorrentes e falhas do PSP são cobertas por testes com PostgreSQL e servidor HTTP local de teste. O adaptador autenticado de checkout do lojista vincula essa coordenação a uma `Idempotency-Key` persistente e cria a sessão a partir do registro autoritativo do PSP. O PostgreSQL mantém resultados ambíguos como `unknown`; essas tentativas nunca repetem o POST. A reconciliação usa concessões com expiração no PostgreSQL e `SKIP LOCKED`; consultas GET que falham agendam novas tentativas com espera exponencial limitada e variação aleatória. O processo opcional de reconciliação usa somente GET, fica desabilitado por padrão e tem limites conservadores. Mantenha o AppID exclusivamente no servidor.
 
-The opt-in `POST /v1/webhooks/woovi` receiver verifies `x-webhook-signature` using Woovi RSA public keys, atomically deduplicates raw events and applies matching completed/expired charge events by correlation ID and cent value. Unsupported events are ignored; inconsistent signed events are quarantined with HTTP 202. Sandbox can use its own keys endpoint as documented above. This is **not merchant fulfillment**: neither webhook status nor the mobile callback alone authorizes production order delivery. AppID must remain server-only. PostgreSQL persists checkout/token/event/attempt state; the memory fallback is only for the default simulated flow. Neither mode makes this example production-ready.
+O receptor opcional `POST /v1/webhooks/woovi` verifica `x-webhook-signature` usando as chaves públicas RSA da Woovi, elimina eventos brutos duplicados atomicamente e aplica eventos de cobrança concluída ou expirada quando o identificador de correlação e o valor em centavos correspondem. Eventos não suportados são ignorados; eventos assinados inconsistentes são colocados em quarentena com HTTP 202. O sandbox pode usar seu próprio endpoint de chaves, conforme documentado acima. Isso **não implementa a liberação do pedido pelo lojista**: nem o estado do webhook nem o callback do aplicativo, isoladamente, autorizam a entrega de pedidos em produção. O AppID deve permanecer no servidor. O PostgreSQL persiste os estados de checkout, token, evento e tentativa; o armazenamento em memória é exclusivo do fluxo simulado padrão. Nenhum dos modos torna este exemplo pronto para produção.
 
-Verified docs: [API authentication](https://developers.woovi.com/en/docs/apis/api-getting-started) uses `Authorization: <AppID>` and requires HTTPS; [charge creation](https://developers.woovi.com/en/docs/charge/how-to-create-charge-using-api) uses `POST /api/v1/charge`, cent values and `correlationID`; [charge completed webhook payload](https://developers.woovi.com/en/docs/webhook/examples/webhook-charge-payload) includes event `OPENPIX:CHARGE_COMPLETED`, `charge.correlationID`, status `COMPLETED`, and `pix.status=CONFIRMED`; [webhook public keys](https://developers.woovi.com/en/docs/webhook/seguranca/webhook-public-keys) specifies `x-webhook-signature = base64(RSA-SHA256(raw body))`, accepts rotating public keys, and says cache for one hour with stale-cache fallback; [webhook retries](https://developers.woovi.com/en/docs/webhook/webhook-retry) documents 8 attempts and retries on HTTP >400/unavailability. Charge lookup/status semantics and PSP idempotency guarantees still need verification. No live/sandbox API request has been made.
+Documentação verificada: [autenticação da API](https://developers.woovi.com/en/docs/apis/api-getting-started) usa `Authorization: <AppID>` e exige HTTPS; [criação de cobrança](https://developers.woovi.com/en/docs/charge/how-to-create-charge-using-api) usa `POST /api/v1/charge`, valores em centavos e `correlationID`; [notificação de cobrança concluída](https://developers.woovi.com/en/docs/webhook/examples/webhook-charge-payload) inclui o evento `OPENPIX:CHARGE_COMPLETED`, `charge.correlationID`, estado `COMPLETED` e `pix.status=CONFIRMED`; [chaves públicas do webhook](https://developers.woovi.com/en/docs/webhook/seguranca/webhook-public-keys) especifica `x-webhook-signature = base64(RSA-SHA256(raw body))`, aceita rotação de chaves e orienta manter cache por uma hora, com uso do cache anterior em caso de falha; [novas tentativas de webhook](https://developers.woovi.com/en/docs/webhook/webhook-retry) documenta 8 tentativas e repetição em HTTP >400 ou indisponibilidade. A semântica de consulta e estado das cobranças e as garantias de idempotência do PSP ainda precisam de verificação. Nenhuma chamada à API de produção ou sandbox foi realizada.
 
-## Development checks
+## Verificações de desenvolvimento
 
 ```sh
 cd packages/woovi_pix_flutter && mise exec -- dart format --set-exit-if-changed lib test && mise exec -- flutter analyze && mise exec -- flutter test
@@ -170,6 +172,6 @@ cd ../../example && mise exec -- dart format --set-exit-if-changed lib test && m
 cd ../examples/backend && mise exec -- gofmt -l . && mise exec -- go test -count=1 ./... && mise exec -- go build ./... && mise exec -- go vet ./...
 ```
 
-Run backend integration tests with the actual PostgreSQL service by setting the same `DATABASE_URL` before `go test -count=1 ./...`.
+Execute os testes de integração do servidor com o serviço PostgreSQL real, definindo a mesma `DATABASE_URL` antes de `go test -count=1 ./...`. Sem essa variável, os testes que dependem do PostgreSQL são pulados.
 
-See `CHANGELOG.md` and `LICENSE` for project status and terms.
+Consulte `CHANGELOG.md` e `LICENSE` para o histórico e os termos do projeto.
