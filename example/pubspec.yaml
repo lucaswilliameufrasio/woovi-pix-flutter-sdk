@@ -1,0 +1,19 @@
+name: woovi_pix_flutter_example
+description: Local demonstration of the woovi_pix_flutter package.
+publish_to: none
+version: 1.0.0+1
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+  flutter: '>=3.24.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.2
+  woovi_pix_flutter:
+    path: ../packages/woovi_pix_flutter
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+flutter:
+  uses-material-design: true
