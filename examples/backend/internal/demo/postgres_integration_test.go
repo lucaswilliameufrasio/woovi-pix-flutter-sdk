@@ -3,6 +3,7 @@ package demo
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"os"
 	"sync"
 	"testing"
@@ -164,5 +165,73 @@ func TestPostgresConcurrentSessionCreationReusesCheckout(t *testing.T) {
 		if _, err := store.Status(ctx, checkoutID, sha256.Sum256([]byte(result.token)), time.Now()); err != nil {
 			t.Fatalf("parallel session token invalid: %v", err)
 		}
+	}
+}
+
+func TestPostgresChargeAttemptReservationAndAmbiguousRecovery(t *testing.T) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("set DATABASE_URL to run PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	store, err := OpenPostgres(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	orderID := "attempt-" + time.Now().Format("150405.000000000")
+	if _, err := store.pool.Exec(ctx, `INSERT INTO demo_orders(order_id, amount_cents) VALUES ($1, $2)`, orderID, 7599); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.pool.Exec(ctx, `DELETE FROM psp_charge_attempts WHERE order_id=$1`, orderID); err != nil {
+			t.Errorf("cleanup charge attempts: %v", err)
+		}
+		if _, err := store.pool.Exec(ctx, `DELETE FROM demo_orders WHERE order_id=$1`, orderID); err != nil {
+			t.Errorf("cleanup demo order: %v", err)
+		}
+	})
+
+	now := time.Now().UTC()
+	reserved, err := store.ReserveChargeAttempt(ctx, orderID, now)
+	if err != nil || reserved.State != ChargeAttemptReserved || reserved.AmountCents != 7599 {
+		t.Fatalf("reservation=%#v err=%v", reserved, err)
+	}
+	recovered, err := store.ReserveChargeAttempt(ctx, orderID, now.Add(time.Second))
+	if err != nil || recovered.ID != reserved.ID || recovered.CorrelationID != reserved.CorrelationID {
+		t.Fatalf("reservation recovery=%#v err=%v", recovered, err)
+	}
+	if err := store.MarkChargeAttemptSubmitting(ctx, reserved.ID, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordChargeAttemptUnknown(ctx, reserved.ID, "timeout", now.Add(12*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkChargeAttemptSubmitting(ctx, reserved.ID, now.Add(13*time.Second)); !errors.Is(err, ErrChargeAttemptState) {
+		t.Fatalf("ambiguous attempt must not be POSTed again: %v", err)
+	}
+	toReconcile, err := store.ListChargeAttemptsNeedingReconciliation(ctx, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, attempt := range toReconcile {
+		if attempt.ID == reserved.ID && attempt.CorrelationID == reserved.CorrelationID && attempt.State == ChargeAttemptUnknown {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("unknown attempt missing from reconciliation queue")
+	}
+	charge := WooviCharge{CorrelationID: reserved.CorrelationID, Status: "ACTIVE", BRCode: "pix-fixture", ExpiresAt: now.Add(15 * time.Minute)}
+	if err := store.MarkChargeAttemptCreated(ctx, reserved.ID, charge, now.Add(20*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var state, brCode string
+	if err := store.pool.QueryRow(ctx, `SELECT state, br_code FROM psp_charge_attempts WHERE attempt_id=$1`, reserved.ID).Scan(&state, &brCode); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(ChargeAttemptCreated) || brCode != charge.BRCode {
+		t.Fatalf("persisted PSP outcome state=%s br_code=%s", state, brCode)
 	}
 }

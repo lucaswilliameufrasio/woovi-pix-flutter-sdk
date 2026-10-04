@@ -139,10 +139,12 @@ func (s *PostgresStore) Create(ctx context.Context, orderID string, now time.Tim
 	}
 	expiresAt := now.Add(15 * time.Minute)
 	brCode := "000201-DEMO-PIX-" + id
+	correlationID := id
+	statusValue := string(Pending)
 	hash := sha256.Sum256([]byte(token))
 	_, err = tx.Exec(ctx, `INSERT INTO checkout_sessions
 		(checkout_id, order_id, correlation_id, token_hash, amount_cents, status, expires_at, br_code, created_at)
-		VALUES ($1,$2,$1,$3,$4,'pending',$5,$6,$7)`, id, orderID, hash[:], amount, expiresAt, brCode, now)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, id, orderID, correlationID, hash[:], amount, statusValue, expiresAt, brCode, now)
 	if err != nil {
 		return nil, "", false, err
 	}
