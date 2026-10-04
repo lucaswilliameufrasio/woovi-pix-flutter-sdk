@@ -54,6 +54,47 @@ type ChargeCreator interface {
 	CreateCharge(context.Context, string, int64) (WooviCharge, error)
 }
 
+const chargeAttemptSubmissionErrorCode = "charge_submit_failed"
+
+// SubmitChargeForOrder runs one durable PSP submission attempt. Only a
+// reservation that atomically crosses reserved -> submitting may issue POST;
+// every later call for the same order returns without issuing another POST.
+func SubmitChargeForOrder(ctx context.Context, store *PostgresStore, creator ChargeCreator, orderID string, now time.Time) (ChargeAttempt, WooviCharge, error) {
+	if store == nil || creator == nil || orderID == "" {
+		return ChargeAttempt{}, WooviCharge{}, errors.New("invalid charge submission dependencies")
+	}
+	attempt, err := store.ReserveChargeAttempt(ctx, orderID, now)
+	if err != nil {
+		return ChargeAttempt{}, WooviCharge{}, err
+	}
+	if attempt.State != ChargeAttemptReserved {
+		return attempt, WooviCharge{}, ErrChargeAttemptState
+	}
+	if err := store.MarkChargeAttemptSubmitting(ctx, attempt.ID, now); err != nil {
+		return attempt, WooviCharge{}, err
+	}
+	attempt.State = ChargeAttemptSubmitting
+
+	charge, createErr := creator.CreateCharge(ctx, attempt.CorrelationID, attempt.AmountCents)
+	if createErr != nil {
+		// The request may have reached the PSP even if the caller context was
+		// canceled. Persist the uncertainty with a short independent context;
+		// if storage is unavailable, durable submitting remains GET-recoverable.
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+		if err := store.RecordChargeAttemptUnknown(persistCtx, attempt.ID, chargeAttemptSubmissionErrorCode, now); err != nil {
+			return attempt, WooviCharge{}, errors.Join(createErr, fmt.Errorf("persist ambiguous charge outcome: %w", err))
+		}
+		attempt.State = ChargeAttemptUnknown
+		return attempt, WooviCharge{}, createErr
+	}
+	if err := store.MarkChargeAttemptCreated(ctx, attempt.ID, charge, now); err != nil {
+		return attempt, charge, err
+	}
+	attempt.State = ChargeAttemptCreated
+	return attempt, charge, nil
+}
+
 // ReserveChargeAttempt commits an immutable amount and PSP correlation ID before
 // any network request. At most one active PSP attempt may exist for an order.
 func (s *PostgresStore) ReserveChargeAttempt(ctx context.Context, orderID string, now time.Time) (ChargeAttempt, error) {

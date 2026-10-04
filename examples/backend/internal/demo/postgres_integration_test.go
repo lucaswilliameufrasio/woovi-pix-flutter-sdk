@@ -445,6 +445,126 @@ func TestPostgresChargeCreateCrashWindowsRecoverWithoutDuplicatePost(t *testing.
 	}
 }
 
+func TestPostgresChargeSubmissionOrchestrationPostsAtMostOnce(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("set DATABASE_URL to run PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	store, err := OpenPostgres(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	concurrentOrder := "orchestrated-race-" + time.Now().Format("150405.000000000")
+	failingOrder := "orchestrated-fail-" + time.Now().Format("150405.000000000")
+	for i, orderID := range []string{concurrentOrder, failingOrder} {
+		if _, err := store.pool.Exec(ctx, `INSERT INTO demo_orders(order_id, amount_cents) VALUES ($1, $2)`, orderID, 8701+int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, orderID := range []string{concurrentOrder, failingOrder} {
+			if _, err := store.pool.Exec(ctx, `DELETE FROM psp_charge_attempts WHERE order_id=$1`, orderID); err != nil {
+				t.Errorf("cleanup charge attempts: %v", err)
+			}
+			if _, err := store.pool.Exec(ctx, `DELETE FROM demo_orders WHERE order_id=$1`, orderID); err != nil {
+				t.Errorf("cleanup demo order: %v", err)
+			}
+		}
+	})
+	now := time.Now().UTC()
+	var mu sync.Mutex
+	postCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/charge" {
+			t.Errorf("fixture request = %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var request struct {
+			CorrelationID string `json:"correlationID"`
+			Value         int64  `json:"value"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode create payload: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		postCount++
+		mu.Unlock()
+		if request.Value == 8702 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"charge":{"correlationID":"` + request.CorrelationID + `","status":"ACTIVE","brCode":"orchestrated-pix","expiresDate":"` + now.Add(15*time.Minute).Format(time.RFC3339) + `"}}`))
+	}))
+	defer server.Close()
+	client, err := NewWooviChargeClient("fixture-only-app-id", server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const callers = 12
+	type submitResult struct {
+		attempt ChargeAttempt
+		charge  WooviCharge
+		err     error
+	}
+	results := make(chan submitResult, callers)
+	var wait sync.WaitGroup
+	for range callers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			attempt, charge, err := SubmitChargeForOrder(ctx, store, client, concurrentOrder, now)
+			results <- submitResult{attempt: attempt, charge: charge, err: err}
+		}()
+	}
+	wait.Wait()
+	close(results)
+	successes, rejected := 0, 0
+	var winningAttempt ChargeAttempt
+	for result := range results {
+		if result.err == nil {
+			successes++
+			winningAttempt = result.attempt
+			if result.attempt.State != ChargeAttemptCreated || result.charge.Status != "ACTIVE" {
+				t.Fatalf("orchestrated success = %#v charge=%#v", result.attempt, result.charge)
+			}
+		} else if errors.Is(result.err, ErrChargeAttemptState) {
+			rejected++
+		} else {
+			t.Fatalf("unexpected concurrent submit error: %v", result.err)
+		}
+	}
+	if successes != 1 || rejected != callers-1 {
+		t.Fatalf("orchestration successes=%d rejected=%d, want 1/%d", successes, rejected, callers-1)
+	}
+
+	failedAttempt, _, submitErr := SubmitChargeForOrder(ctx, store, client, failingOrder, now)
+	if submitErr == nil || failedAttempt.State != ChargeAttemptUnknown {
+		t.Fatalf("failed PSP submit attempt=%#v err=%v, want unknown", failedAttempt, submitErr)
+	}
+	if _, _, retryErr := SubmitChargeForOrder(ctx, store, client, failingOrder, now.Add(time.Second)); !errors.Is(retryErr, ErrChargeAttemptState) {
+		t.Fatalf("unknown attempt must not be posted again: %v", retryErr)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if postCount != 2 {
+		t.Fatalf("PSP fixture received %d POSTs, want exactly one per order (2 total)", postCount)
+	}
+	var state string
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM psp_charge_attempts WHERE attempt_id=$1`, winningAttempt.ID).Scan(&state); err != nil || state != string(ChargeAttemptCreated) {
+		t.Fatalf("successful durable attempt state=%q err=%v", state, err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM psp_charge_attempts WHERE attempt_id=$1`, failedAttempt.ID).Scan(&state); err != nil || state != string(ChargeAttemptUnknown) {
+		t.Fatalf("failed durable attempt state=%q err=%v", state, err)
+	}
+}
+
 func TestPostgresConcurrentSessionCreationReusesCheckout(t *testing.T) {
 	url := os.Getenv("DATABASE_URL")
 	if url == "" {
