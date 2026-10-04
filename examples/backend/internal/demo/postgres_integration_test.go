@@ -138,6 +138,10 @@ func TestPostgresWebhookResolvesChargeAttemptOutOfOrderWithoutCheckout(t *testin
 	if err := store.MarkChargeAttemptSubmitting(ctx, attempt.ID, now); err != nil {
 		t.Fatal(err)
 	}
+	claimed, err := store.ClaimChargeAttemptsForReconciliation(ctx, "stale-get-worker", 10, now.Add(time.Second), time.Minute)
+	if err != nil || len(claimed) != 1 || claimed[0].ID != attempt.ID {
+		t.Fatalf("claim for delayed reconciliation = %#v, err=%v", claimed, err)
+	}
 	makeEvent := func(kind, status string) WooviChargeEvent {
 		event := WooviChargeEvent{Event: kind}
 		event.Charge.CorrelationID = attempt.CorrelationID
@@ -207,6 +211,19 @@ func TestPostgresWebhookResolvesChargeAttemptOutOfOrderWithoutCheckout(t *testin
 	}
 	if state != string(ChargeAttemptResolved) || providerStatus != "COMPLETED" {
 		t.Fatalf("attempt state/status = %s/%s, want resolved/COMPLETED", state, providerStatus)
+	}
+	staleActive := WooviCharge{CorrelationID: attempt.CorrelationID, Value: attempt.AmountCents, Status: "ACTIVE", BRCode: "stale-pix", ExpiresAt: now.Add(15 * time.Minute)}
+	if err := store.RecordChargeAttemptReconciliation(ctx, attempt.ID, claimed[0].LeaseToken, staleActive, now.Add(2*time.Second)); !errors.Is(err, ErrChargeAttemptState) {
+		t.Fatalf("stale GET result must lose after webhook resolves attempt: %v", err)
+	}
+	if err := store.MarkChargeAttemptCreated(ctx, attempt.ID, staleActive, now.Add(3*time.Second)); !errors.Is(err, ErrChargeAttemptState) {
+		t.Fatalf("late POST response must not regress webhook-resolved attempt: %v", err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT state, provider_status FROM psp_charge_attempts WHERE attempt_id=$1`, attempt.ID).Scan(&state, &providerStatus); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(ChargeAttemptResolved) || providerStatus != "COMPLETED" {
+		t.Fatalf("stale result changed attempt to %s/%s", state, providerStatus)
 	}
 	var checkoutCount int
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM checkout_sessions WHERE order_id=$1`, orderID).Scan(&checkoutCount); err != nil {
