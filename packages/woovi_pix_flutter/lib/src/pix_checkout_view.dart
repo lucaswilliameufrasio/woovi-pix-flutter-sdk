@@ -30,6 +30,7 @@ class _PixCheckoutViewState extends State<PixCheckoutView> {
             });
           }
           final session = controller.session;
+          final pixCopyPaste = session.pixCopyPaste;
           final statusLabel = switch (controller.status) {
             CheckoutStatus.pending => 'Aguardando pagamento',
             CheckoutStatus.paid => 'Pagamento confirmado pelo servidor',
@@ -46,21 +47,25 @@ class _PixCheckoutViewState extends State<PixCheckoutView> {
                     style: Theme.of(context).textTheme.headlineSmall),
                 Text(statusLabel),
                 const SizedBox(height: 16),
-                if (controller.status == CheckoutStatus.pending) ...[
+                if (controller.status == CheckoutStatus.pending &&
+                    pixCopyPaste != null) ...[
                   Center(
                       child: QrImageView(
-                          data: session.pixCopyPaste,
+                          data: pixCopyPaste,
                           size: 220,
                           semanticsLabel: 'QR Code Pix')),
-                  SelectableText(session.pixCopyPaste),
+                  SelectableText(pixCopyPaste),
                   TextButton.icon(
-                    onPressed: () => Clipboard.setData(
-                        ClipboardData(text: session.pixCopyPaste)),
+                    onPressed: () =>
+                        Clipboard.setData(ClipboardData(text: pixCopyPaste)),
                     icon: const Icon(Icons.copy),
                     label: const Text('Copiar código Pix'),
                   ),
                   Text('Válido até ${session.expiresAt.toLocal()}'),
                 ],
+                if (controller.status == CheckoutStatus.pending &&
+                    pixCopyPaste == null)
+                  const Text('Aguardando os dados Pix do servidor.'),
                 if (controller.transportError != null)
                   Text(
                       'Não foi possível consultar. O pagamento continua sem confirmação.',

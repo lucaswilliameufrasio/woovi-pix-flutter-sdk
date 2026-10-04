@@ -18,18 +18,25 @@ class CheckoutSession {
   final int amountCents;
   final String currency;
   final DateTime expiresAt;
-  final String pixCopyPaste;
+  final String? pixCopyPaste;
 
   factory CheckoutSession.fromJson(Map<String, Object?> json) {
     final id = _requiredString(json, 'checkout_id');
     final token = _requiredString(json, 'access_token');
     final currency = _requiredString(json, 'currency');
-    final copyPaste = _requiredString(json, 'pix_copy_paste');
+    final status = _parseStatus(json['status']);
+    final copyPasteValue = json['pix_copy_paste'];
+    if (copyPasteValue != null && copyPasteValue is! String) {
+      throw const FormatException('Invalid pix_copy_paste');
+    }
+    final copyPaste = copyPasteValue as String?;
     final cents = json['amount_cents'];
     if (id.length > 128 ||
         token.length > 4096 ||
         currency != 'BRL' ||
-        copyPaste.length > 4096 ||
+        (copyPaste?.length ?? 0) > 4096 ||
+        (status == CheckoutStatus.pending &&
+            (copyPaste == null || copyPaste.isEmpty)) ||
         cents is! int ||
         cents < 0 ||
         cents > 100000000) {
@@ -42,7 +49,7 @@ class CheckoutSession {
     return CheckoutSession(
       id: id,
       accessToken: token,
-      status: _parseStatus(json['status']),
+      status: status,
       amountCents: cents,
       currency: currency,
       expiresAt: expiry.toUtc(),

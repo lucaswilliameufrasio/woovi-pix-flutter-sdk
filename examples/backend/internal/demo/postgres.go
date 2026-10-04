@@ -103,7 +103,7 @@ func (s *PostgresStore) Create(ctx context.Context, orderID string, now time.Tim
 	}
 	var c checkout
 	var status string
-	err = tx.QueryRow(ctx, `SELECT checkout_id, order_id, correlation_id, amount_cents, status, expires_at, br_code
+	err = tx.QueryRow(ctx, `SELECT checkout_id, order_id, correlation_id, amount_cents, status, expires_at, COALESCE(br_code,'')
 		FROM checkout_sessions WHERE order_id=$1 AND status='pending' AND expires_at>$2
 		ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, orderID, now).Scan(
 		&c.id, &c.orderID, &c.correlationID, &c.amount, &status, &c.expiresAt, &c.brCode)
@@ -174,7 +174,7 @@ func (s *PostgresStore) Status(ctx context.Context, id string, tokenHash [32]byt
 	if grantCheckoutID != id {
 		return nil, ErrCheckoutNotFound
 	}
-	c, err := scanCheckout(tx.QueryRow(ctx, `SELECT c.checkout_id, t.token_hash, c.order_id, c.correlation_id, c.amount_cents, c.status, c.expires_at, c.br_code
+	c, err := scanCheckout(tx.QueryRow(ctx, `SELECT c.checkout_id, t.token_hash, c.order_id, c.correlation_id, c.amount_cents, c.status, c.expires_at, COALESCE(c.br_code,'')
 		FROM checkout_sessions c JOIN checkout_session_tokens t ON t.checkout_id=c.checkout_id
 		WHERE c.checkout_id=$1 AND t.token_hash=$2 AND t.expires_at>$3 FOR UPDATE OF c`, id, tokenHash[:], now))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -199,7 +199,7 @@ func (s *PostgresStore) SimulatePaid(ctx context.Context, id string, _ time.Time
 	var c checkout
 	var status string
 	err := s.pool.QueryRow(ctx, `UPDATE checkout_sessions SET status='paid'
-		WHERE checkout_id=$1 RETURNING checkout_id, order_id, amount_cents, status, expires_at, br_code`, id).Scan(
+		WHERE checkout_id=$1 RETURNING checkout_id, order_id, amount_cents, status, expires_at, COALESCE(br_code,'')`, id).Scan(
 		&c.id, &c.orderID, &c.amount, &status, &c.expiresAt, &c.brCode)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrCheckoutNotFound
@@ -217,8 +217,8 @@ func (s *PostgresStore) ApplyChargeEvent(ctx context.Context, event WooviChargeE
 		return WebhookResult{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	tag, err := tx.Exec(ctx, `INSERT INTO webhook_events(event_hash, correlation_id, event_type)
-		VALUES ($1,$2,$3) ON CONFLICT (event_hash) DO NOTHING`, eventHash[:], event.Charge.CorrelationID, event.Event)
+	tag, err := tx.Exec(ctx, `INSERT INTO webhook_events(event_hash, correlation_id, event_type, outcome)
+		VALUES ($1,$2,$3,'ignored') ON CONFLICT (event_hash) DO NOTHING`, eventHash[:], event.Charge.CorrelationID, event.Event)
 	if err != nil {
 		return WebhookResult{}, err
 	}
@@ -228,37 +228,29 @@ func (s *PostgresStore) ApplyChargeEvent(ctx context.Context, event WooviChargeE
 		}
 		return WebhookResult{Duplicate: true}, nil
 	}
+	// Update webhook_events first. A brand-new attempt cannot have a checkout
+	// row yet, so resolve by the durable correlation ledger before session lookup.
+	var attemptID string
+	var attemptAmount int64
+	var providerStatus string
+	attemptErr := tx.QueryRow(ctx, `SELECT attempt_id, amount_cents, COALESCE(provider_status,'')
+		FROM psp_charge_attempts WHERE correlation_id=$1 FOR UPDATE`, event.Charge.CorrelationID).
+		Scan(&attemptID, &attemptAmount, &providerStatus)
+	if attemptErr != nil && !errors.Is(attemptErr, pgx.ErrNoRows) {
+		return WebhookResult{}, attemptErr
+	}
+	hasAttempt := attemptErr == nil
 	var c checkout
 	var status string
-	err = tx.QueryRow(ctx, `SELECT checkout_id, order_id, correlation_id, amount_cents, status, expires_at, br_code
+	err = tx.QueryRow(ctx, `SELECT checkout_id, order_id, correlation_id, amount_cents, status, expires_at, COALESCE(br_code,'')
 		FROM checkout_sessions WHERE correlation_id=$1 FOR UPDATE`, event.Charge.CorrelationID).Scan(
 		&c.id, &c.orderID, &c.correlationID, &c.amount, &status, &c.expiresAt, &c.brCode)
 	if errors.Is(err, pgx.ErrNoRows) {
-		var attemptID string
-		var amount int64
-		var providerStatus string
-		attemptErr := tx.QueryRow(ctx, `SELECT attempt_id, amount_cents, COALESCE(provider_status, '')
-			FROM psp_charge_attempts WHERE correlation_id=$1 FOR UPDATE`, event.Charge.CorrelationID).
-			Scan(&attemptID, &amount, &providerStatus)
-		if attemptErr != nil && !errors.Is(attemptErr, pgx.ErrNoRows) {
-			return WebhookResult{}, attemptErr
-		}
-		if errors.Is(attemptErr, pgx.ErrNoRows) {
+		if !hasAttempt {
 			if err = tx.Commit(ctx); err != nil {
 				return WebhookResult{}, err
 			}
 			return WebhookResult{Ignored: true}, nil
-		}
-		if isChargeStateEvent(event.Event) && (event.Charge.Value != amount ||
-			(event.Event == "OPENPIX:CHARGE_COMPLETED" && (event.Charge.Status != "COMPLETED" || event.Pix.Status != "CONFIRMED")) ||
-			(event.Event == "OPENPIX:CHARGE_EXPIRED" && event.Charge.Status != "EXPIRED")) {
-			if _, err = tx.Exec(ctx, `UPDATE webhook_events SET outcome='rejected_mismatch' WHERE event_hash=$1`, eventHash[:]); err != nil {
-				return WebhookResult{}, err
-			}
-			if err = tx.Commit(ctx); err != nil {
-				return WebhookResult{}, err
-			}
-			return WebhookResult{Rejected: true}, nil
 		}
 		if !isChargeStateEvent(event.Event) {
 			if _, err = tx.Exec(ctx, `UPDATE webhook_events SET outcome='ignored' WHERE event_hash=$1`, eventHash[:]); err != nil {
@@ -269,20 +261,24 @@ func (s *PostgresStore) ApplyChargeEvent(ctx context.Context, event WooviChargeE
 			}
 			return WebhookResult{Ignored: true}, nil
 		}
-		observed := event.Charge.Status
-		if _, err = tx.Exec(ctx, `UPDATE psp_charge_attempts
-			SET state='resolved', provider_status=CASE
-				WHEN provider_status='COMPLETED' OR $2='COMPLETED' THEN 'COMPLETED'
-				WHEN provider_status='EXPIRED' OR $2='EXPIRED' THEN 'EXPIRED'
-				ELSE 'ACTIVE' END,
-				updated_at=now(), reconcile_lease_token=NULL, reconcile_lease_until=NULL
-			WHERE attempt_id=$1`, attemptID, observed); err != nil {
+		if event.Charge.Value != attemptAmount ||
+			(event.Event == "OPENPIX:CHARGE_COMPLETED" && (event.Charge.Status != "COMPLETED" || event.Pix.Status != "CONFIRMED")) ||
+			(event.Event == "OPENPIX:CHARGE_EXPIRED" && event.Charge.Status != "EXPIRED") {
+			if _, err = tx.Exec(ctx, `UPDATE webhook_events SET outcome='rejected_mismatch' WHERE event_hash=$1`, eventHash[:]); err != nil {
+				return WebhookResult{}, err
+			}
+			if err = tx.Commit(ctx); err != nil {
+				return WebhookResult{}, err
+			}
+			return WebhookResult{Rejected: true}, nil
+		}
+		if err := applyChargeStatusToAttempt(ctx, tx, attemptID, event.Charge.Status); err != nil {
 			return WebhookResult{}, err
 		}
-		outcome := "applied"
-		applied := true
-		if providerStatus == "COMPLETED" || (providerStatus == "EXPIRED" && observed == "ACTIVE") || providerStatus == observed {
-			outcome, applied = "ignored", false
+		applied := providerStatus != "COMPLETED" && providerStatus != event.Charge.Status
+		outcome := "ignored"
+		if applied {
+			outcome = "applied"
 		}
 		if _, err = tx.Exec(ctx, `UPDATE webhook_events SET applied=$2, outcome=$3 WHERE event_hash=$1`, eventHash[:], applied, outcome); err != nil {
 			return WebhookResult{}, err
@@ -296,9 +292,7 @@ func (s *PostgresStore) ApplyChargeEvent(ctx context.Context, event WooviChargeE
 		return WebhookResult{}, err
 	}
 	c.status = Status(status)
-	if isChargeStateEvent(event.Event) && (event.Charge.Value != c.amount ||
-		(event.Event == "OPENPIX:CHARGE_COMPLETED" && (event.Charge.Status != "COMPLETED" || event.Pix.Status != "CONFIRMED")) ||
-		(event.Event == "OPENPIX:CHARGE_EXPIRED" && event.Charge.Status != "EXPIRED")) {
+	if hasAttempt && event.Charge.Value != attemptAmount {
 		if _, err = tx.Exec(ctx, `UPDATE webhook_events SET outcome='rejected_mismatch' WHERE event_hash=$1`, eventHash[:]); err != nil {
 			return WebhookResult{}, err
 		}
@@ -306,6 +300,31 @@ func (s *PostgresStore) ApplyChargeEvent(ctx context.Context, event WooviChargeE
 			return WebhookResult{}, err
 		}
 		return WebhookResult{Rejected: true}, nil
+	}
+	if !isChargeStateEvent(event.Event) {
+		if _, err = tx.Exec(ctx, `UPDATE webhook_events SET outcome='ignored' WHERE event_hash=$1`, eventHash[:]); err != nil {
+			return WebhookResult{}, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return WebhookResult{}, err
+		}
+		return WebhookResult{Ignored: true}, nil
+	}
+	if event.Charge.Value != c.amount || (hasAttempt && attemptAmount != c.amount) ||
+		(event.Event == "OPENPIX:CHARGE_COMPLETED" && (event.Charge.Status != "COMPLETED" || event.Pix.Status != "CONFIRMED")) ||
+		(event.Event == "OPENPIX:CHARGE_EXPIRED" && event.Charge.Status != "EXPIRED") {
+		if _, err = tx.Exec(ctx, `UPDATE webhook_events SET outcome='rejected_mismatch' WHERE event_hash=$1`, eventHash[:]); err != nil {
+			return WebhookResult{}, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return WebhookResult{}, err
+		}
+		return WebhookResult{Rejected: true}, nil
+	}
+	if hasAttempt {
+		if err := applyChargeStatusToAttempt(ctx, tx, attemptID, event.Charge.Status); err != nil {
+			return WebhookResult{}, err
+		}
 	}
 	applied := false
 	switch event.Event {
@@ -335,6 +354,17 @@ func (s *PostgresStore) ApplyChargeEvent(ctx context.Context, event WooviChargeE
 		return WebhookResult{}, err
 	}
 	return WebhookResult{Applied: applied, Ignored: !applied}, nil
+}
+
+func applyChargeStatusToAttempt(ctx context.Context, tx pgx.Tx, attemptID, observed string) error {
+	_, err := tx.Exec(ctx, `UPDATE psp_charge_attempts
+		SET state='resolved', provider_status=CASE
+			WHEN provider_status='COMPLETED' OR $2='COMPLETED' THEN 'COMPLETED'
+			WHEN provider_status='EXPIRED' OR $2='EXPIRED' THEN 'EXPIRED'
+			ELSE 'ACTIVE' END,
+			updated_at=now(), reconcile_lease_token=NULL, reconcile_lease_until=NULL
+		WHERE attempt_id=$1`, attemptID, observed)
+	return err
 }
 
 type rowScanner interface {

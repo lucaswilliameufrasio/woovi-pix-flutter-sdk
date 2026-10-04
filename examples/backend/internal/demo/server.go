@@ -40,10 +40,11 @@ type checkout struct {
 }
 
 type Server struct {
-	store        CheckoutStore
-	clockNow     func() time.Time
-	webhookAuth  WebhookVerifier
-	allowDemoPay bool
+	store            CheckoutStore
+	clockNow         func() time.Time
+	webhookAuth      WebhookVerifier
+	allowDemoPay     bool
+	merchantCheckout *merchantCheckoutService
 }
 
 func NewServer() *Server {
@@ -71,6 +72,9 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("POST "+apiCheckoutSessionsPath, s.createSession)
+	if s.merchantCheckout != nil {
+		mux.HandleFunc("POST /v1/merchant/checkout-sessions", s.createMerchantCheckout)
+	}
 	mux.HandleFunc("GET /v1/checkout-sessions/{id}", s.getStatus)
 	if s.allowDemoPay {
 		mux.HandleFunc("POST "+apiDemoPayPath, s.simulatePaid)
@@ -84,6 +88,122 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/webhooks/", apiNotFound)
 	mux.HandleFunc("/", apiNotFound)
 	return securityHeaders(mux)
+}
+
+// ConfigureMerchantCheckout enables the authenticated, PSP-backed endpoint.
+// It must be called before Handler; without a trusted merchant authorizer the
+// route stays absent. This demo binary intentionally does not configure one.
+func (s *Server) ConfigureMerchantCheckout(authorizer MerchantCheckoutAuthorizer, creator ChargeCreator) error {
+	store, ok := s.store.(*PostgresStore)
+	if !ok || authorizer == nil || creator == nil {
+		return errors.New("merchant checkout requires PostgreSQL and trusted authorizer/client")
+	}
+	s.merchantCheckout = &merchantCheckoutService{store: store, authorizer: authorizer, creator: creator, clockNow: s.clockNow}
+	return nil
+}
+
+func (s *Server) createMerchantCheckout(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		OrderID string `json:"order_id"`
+	}
+	if err := decodeJSON(w, r, &request); err != nil {
+		writeAPIError(w, decodeAPIError(err))
+		return
+	}
+	if request.OrderID == "" || len(request.OrderID) > 128 {
+		writeAPIError(w, invalidParams("order_id", "deve conter entre 1 e 128 caracteres"))
+		return
+	}
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if len(idempotencyKey) < 8 || len(idempotencyKey) > 128 || strings.TrimSpace(idempotencyKey) != idempotencyKey {
+		writeAPIError(w, invalidParams("Idempotency-Key", "é obrigatório e deve conter entre 8 e 128 caracteres"))
+		return
+	}
+	order, err := s.merchantCheckout.authorizer.AuthorizeCheckoutOrder(r.Context(), r, request.OrderID)
+	if errors.Is(err, ErrCheckoutUnauthorized) {
+		writeAPIError(w, unauthorized())
+		return
+	}
+	if errors.Is(err, ErrOrderNotFound) {
+		writeAPIError(w, resourceNotFound("order"))
+		return
+	}
+	if err != nil || order.OrderID != request.OrderID || order.AmountCents <= 0 {
+		writeAPIError(w, unexpectedError())
+		return
+	}
+	attempt, err := s.merchantCheckout.store.ReserveChargeAttemptWithIdempotency(r.Context(), request.OrderID, idempotencyKey, s.clockNow())
+	if errors.Is(err, ErrOrderNotFound) {
+		writeAPIError(w, resourceNotFound("order"))
+		return
+	}
+	if errors.Is(err, ErrIdempotencyConflict) {
+		writeAPIError(w, apiConflict("IDEMPOTENCY_CONFLICT", "A chave de idempotência já foi usada em outra requisição"))
+		return
+	}
+	if errors.Is(err, ErrOrderAlreadyPaid) {
+		writeAPIError(w, apiConflict("ORDER_ALREADY_PAID", "O pedido já foi pago"))
+		return
+	}
+	if errors.Is(err, ErrChargeAttemptState) {
+		writeAPIError(w, apiConflict("IDEMPOTENCY_KEY_REPLAY", "A chave de idempotência pertence a uma tentativa expirada; use uma nova chave para tentar novamente"))
+		return
+	}
+	if errors.Is(err, ErrChargeInProgress) {
+		writeAPIError(w, apiConflict("PAYMENT_PROCESSING", "O pagamento está sendo confirmado; repita a consulta com a mesma chave de idempotência"))
+		return
+	}
+	if err != nil {
+		writeAPIError(w, unexpectedError())
+		return
+	}
+	if attempt.AmountCents != order.AmountCents {
+		writeAPIError(w, apiConflict("ORDER_AMOUNT_CHANGED", "O valor do pedido mudou; atualize o pedido antes de tentar pagar"))
+		return
+	}
+	if attempt.State == ChargeAttemptReserved {
+		// A webhook may resolve the attempt before the POST response is persisted.
+		// Always derive the response from the durable row below, never from stale
+		// provider response data.
+		submitted, _, submitErr := SubmitReservedChargeAttempt(r.Context(), s.merchantCheckout.store, s.merchantCheckout.creator, attempt, s.clockNow())
+		if submitErr == nil {
+			attempt = submitted
+		} else if errors.Is(submitErr, ErrChargeAttemptState) {
+			var state ChargeAttemptState
+			var providerStatus string
+			if readErr := s.merchantCheckout.store.pool.QueryRow(r.Context(), `SELECT state, COALESCE(provider_status,'') FROM psp_charge_attempts WHERE attempt_id=$1`, attempt.ID).Scan(&state, &providerStatus); readErr == nil && state == ChargeAttemptResolved && (providerStatus == "COMPLETED" || providerStatus == "EXPIRED") {
+				attempt.State = state
+			} else {
+				writeAPIError(w, apiConflict("PAYMENT_PROCESSING", "O pagamento está sendo confirmado; repita a consulta com a mesma chave de idempotência"))
+				return
+			}
+		} else {
+			writeAPIError(w, dependencyError("PAYMENT_PROCESSING", "O pagamento está sendo confirmado; consulte novamente com a mesma chave de idempotência", "CHARGE_SUBMISSION_UNCERTAIN"))
+			return
+		}
+	}
+	if attempt.State == ChargeAttemptSubmitting || attempt.State == ChargeAttemptUnknown {
+		writeAPIError(w, apiConflict("PAYMENT_PROCESSING", "O pagamento está sendo confirmado; repita a consulta com a mesma chave de idempotência"))
+		return
+	}
+	c, token, created, sessionErr := s.merchantCheckout.store.CreateCheckoutForChargeAttempt(r.Context(), attempt.ID, s.clockNow())
+	if errors.Is(sessionErr, ErrChargeInProgress) {
+		writeAPIError(w, apiConflict("PAYMENT_PROCESSING", "O pagamento está sendo confirmado; repita a consulta com a mesma chave de idempotência"))
+		return
+	}
+	if errors.Is(sessionErr, ErrOrderAlreadyPaid) {
+		writeAPIError(w, apiConflict("ORDER_ALREADY_PAID", "O pedido já foi pago"))
+		return
+	}
+	if sessionErr != nil {
+		writeAPIError(w, unexpectedError())
+		return
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeSessionJSON(w, status, c, token)
 }
 
 func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
@@ -211,10 +331,14 @@ func randomHex(bytes int) (string, error) {
 }
 
 func writeSessionJSON(w http.ResponseWriter, status int, c *checkout, token string) {
-	writeJSON(w, status, map[string]any{
+	body := map[string]any{
 		"checkout_id": c.id, "access_token": token, "status": c.status, "amount_cents": c.amount,
-		"currency": "BRL", "expires_at": c.expiresAt.UTC().Format(time.RFC3339), "pix_copy_paste": c.brCode,
-	})
+		"currency": "BRL", "expires_at": c.expiresAt.UTC().Format(time.RFC3339),
+	}
+	if c.brCode != "" {
+		body["pix_copy_paste"] = c.brCode
+	}
+	writeJSON(w, status, body)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

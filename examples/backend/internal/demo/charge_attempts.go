@@ -67,6 +67,16 @@ func SubmitChargeForOrder(ctx context.Context, store *PostgresStore, creator Cha
 	if err != nil {
 		return ChargeAttempt{}, WooviCharge{}, err
 	}
+	return SubmitReservedChargeAttempt(ctx, store, creator, attempt, now)
+}
+
+// SubmitReservedChargeAttempt submits exactly the supplied durable reservation.
+// This lets authenticated checkout code bind idempotency before crossing the
+// network boundary without creating a second attempt.
+func SubmitReservedChargeAttempt(ctx context.Context, store *PostgresStore, creator ChargeCreator, attempt ChargeAttempt, now time.Time) (ChargeAttempt, WooviCharge, error) {
+	if store == nil || creator == nil || attempt.ID == "" || attempt.OrderID == "" || attempt.State == "" {
+		return ChargeAttempt{}, WooviCharge{}, errors.New("invalid reserved charge submission")
+	}
 	if attempt.State != ChargeAttemptReserved {
 		return attempt, WooviCharge{}, ErrChargeAttemptState
 	}
@@ -89,6 +99,8 @@ func SubmitChargeForOrder(ctx context.Context, store *PostgresStore, creator Cha
 		return attempt, WooviCharge{}, createErr
 	}
 	if err := store.MarkChargeAttemptCreated(ctx, attempt.ID, charge, now); err != nil {
+		// A terminal webhook can win while the POST response is in flight. In
+		// that case, preserve the terminal observation and resolve from the ledger.
 		return attempt, charge, err
 	}
 	attempt.State = ChargeAttemptCreated
@@ -187,16 +199,29 @@ func (s *PostgresStore) MarkChargeAttemptCreated(ctx context.Context, id string,
 	var expectedCorrelation string
 	var expectedAmount int64
 	var state ChargeAttemptState
-	if err := tx.QueryRow(ctx, `SELECT correlation_id, amount_cents, state FROM psp_charge_attempts WHERE attempt_id=$1 FOR UPDATE`, id).
-		Scan(&expectedCorrelation, &expectedAmount, &state); err != nil {
+	var providerStatus string
+	if err := tx.QueryRow(ctx, `SELECT correlation_id, amount_cents, state, COALESCE(provider_status,'') FROM psp_charge_attempts WHERE attempt_id=$1 FOR UPDATE`, id).
+		Scan(&expectedCorrelation, &expectedAmount, &state, &providerStatus); err != nil {
 		return err
 	}
-	if (state != ChargeAttemptSubmitting && state != ChargeAttemptUnknown) ||
+	terminalWebhookWon := state == ChargeAttemptResolved && (providerStatus == "COMPLETED" || providerStatus == "EXPIRED")
+	if (!terminalWebhookWon && state != ChargeAttemptSubmitting && state != ChargeAttemptUnknown) ||
 		charge.CorrelationID != expectedCorrelation || charge.Value != expectedAmount ||
-		charge.Status != "ACTIVE" || charge.BRCode == "" || !charge.ExpiresAt.After(now) {
+		(charge.Status != "ACTIVE" && charge.Status != "COMPLETED" && charge.Status != "EXPIRED") ||
+		(charge.Status == "ACTIVE" && (charge.BRCode == "" || !charge.ExpiresAt.After(now))) {
 		return ErrChargeAttemptState
 	}
-	_, err = tx.Exec(ctx, `UPDATE psp_charge_attempts SET state='created', br_code=$2, expires_at=$3, updated_at=$4 WHERE attempt_id=$1`, id, charge.BRCode, charge.ExpiresAt, now)
+	if terminalWebhookWon {
+		_ = tx.Rollback(ctx)
+		return ErrChargeAttemptState
+	}
+	if charge.Status == "COMPLETED" || charge.Status == "EXPIRED" {
+		_, err = tx.Exec(ctx, `UPDATE psp_charge_attempts SET state='resolved',
+			provider_status=CASE WHEN provider_status='COMPLETED' OR $2='COMPLETED' THEN 'COMPLETED' WHEN provider_status='EXPIRED' OR $2='EXPIRED' THEN 'EXPIRED' ELSE 'ACTIVE' END,
+			updated_at=$3, reconcile_lease_token=NULL, reconcile_lease_until=NULL WHERE attempt_id=$1`, id, charge.Status, now)
+	} else {
+		_, err = tx.Exec(ctx, `UPDATE psp_charge_attempts SET state='created', provider_status='ACTIVE', br_code=$2, expires_at=$3, updated_at=$4 WHERE attempt_id=$1`, id, charge.BRCode, charge.ExpiresAt, now)
+	}
 	if err != nil {
 		return err
 	}

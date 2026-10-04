@@ -54,6 +54,10 @@ func unexpectedError() *APIError {
 	return &APIError{Status: http.StatusInternalServerError, Message: "Ocorreu um erro inesperado", ErrorCode: "UNEXPECTED_ERROR"}
 }
 
+func apiConflict(code, message string) *APIError {
+	return &APIError{Status: http.StatusConflict, Message: message, ErrorCode: code}
+}
+
 func dependencyError(code, message, providerCode string) *APIError {
 	extra := map[string]any{}
 	if providerCode != "" {

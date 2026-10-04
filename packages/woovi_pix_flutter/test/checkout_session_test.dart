@@ -30,4 +30,31 @@ void main() {
       throwsFormatException,
     );
   });
+
+  test('parses paid checkout without a Pix payload', () {
+    final session = CheckoutSession.fromJson({
+      'checkout_id': 'checkout-paid',
+      'access_token': 'opaque-secret',
+      'status': 'paid',
+      'amount_cents': 100,
+      'currency': 'BRL',
+      'expires_at': '2030-01-01T00:00:00Z',
+    });
+    expect(session.status, CheckoutStatus.paid);
+    expect(session.pixCopyPaste, isNull);
+  });
+
+  test('requires a Pix payload for a pending checkout', () {
+    expect(
+      () => CheckoutSession.fromJson({
+        'checkout_id': 'checkout-pending',
+        'access_token': 'opaque-secret',
+        'status': 'pending',
+        'amount_cents': 100,
+        'currency': 'BRL',
+        'expires_at': '2030-01-01T00:00:00Z',
+      }),
+      throwsFormatException,
+    );
+  });
 }

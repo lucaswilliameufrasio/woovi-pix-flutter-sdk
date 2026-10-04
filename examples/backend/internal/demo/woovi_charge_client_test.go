@@ -47,6 +47,24 @@ func TestWooviChargeClientUsesDocumentedServerRequest(t *testing.T) {
 	}
 }
 
+func TestWooviChargeClientAcceptsTerminalCreationResponseWithoutPix(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"charge":{"correlationID":"order-43","status":"COMPLETED","value":100,"expiresDate":"2030-01-01T00:00:00Z"}}`))
+	}))
+	defer server.Close()
+	client, err := NewWooviChargeClient("fixture-only", server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	charge, err := client.CreateCharge(context.Background(), "order-43", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if charge.Status != "COMPLETED" || charge.Value != 100 || charge.BRCode != "" {
+		t.Fatalf("terminal response = %#v", charge)
+	}
+}
+
 func TestWooviChargeClientNeverRetriesAndRejectsInsecureRemoteURL(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

@@ -111,6 +111,7 @@ func (c *WooviChargeClient) CreateCharge(ctx context.Context, correlationID stri
 		Charge        struct {
 			CorrelationID string `json:"correlationID"`
 			Status        string `json:"status"`
+			Value         int64  `json:"value"`
 			BRCode        string `json:"brCode"`
 			ExpiresDate   string `json:"expiresDate"`
 		} `json:"charge"`
@@ -130,10 +131,14 @@ func (c *WooviChargeClient) CreateCharge(ctx context.Context, correlationID stri
 		brCode = decoded.BRCode
 	}
 	expiresAt, err := time.Parse(time.RFC3339Nano, decoded.Charge.ExpiresDate)
-	if decoded.Charge.Status == "" || brCode == "" || err != nil {
-		return WooviCharge{}, errors.New("woovi charge response is missing status, brCode, or expiresDate")
+	if decoded.Charge.Status == "" || err != nil || (decoded.Charge.Status == "ACTIVE" && brCode == "") {
+		return WooviCharge{}, errors.New("woovi charge response is missing status or valid expiry, or active charge brCode")
 	}
-	return WooviCharge{CorrelationID: correlationID, Status: decoded.Charge.Status, Value: amountCents, BRCode: brCode, ExpiresAt: expiresAt.UTC()}, nil
+	value := decoded.Charge.Value
+	if value == 0 {
+		value = amountCents
+	}
+	return WooviCharge{CorrelationID: correlationID, Status: decoded.Charge.Status, Value: value, BRCode: brCode, ExpiresAt: expiresAt.UTC()}, nil
 }
 
 // GetCharge retrieves one charge by its documented charge ID or correlationID.

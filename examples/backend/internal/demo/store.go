@@ -12,6 +12,9 @@ var (
 	ErrOrderNotFound        = errors.New("order not found")
 	ErrCheckoutNotFound     = errors.New("checkout not found")
 	ErrCheckoutUnauthorized = errors.New("checkout bearer token invalid or expired")
+	ErrIdempotencyConflict  = errors.New("idempotency key already used for a different request")
+	ErrChargeInProgress     = errors.New("charge attempt is still in progress")
+	ErrOrderAlreadyPaid     = errors.New("order already has a completed charge")
 )
 
 // CheckoutStore persists the merchant-owned order and checkout session data.
