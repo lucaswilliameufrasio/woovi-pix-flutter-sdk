@@ -18,6 +18,7 @@ type CheckoutStore interface {
 	Create(context.Context, string, time.Time) (*checkout, string, bool, error)
 	Status(context.Context, string, [32]byte, time.Time) (*checkout, error)
 	SimulatePaid(context.Context, string, time.Time) (*checkout, error)
+	ApplyChargeEvent(context.Context, WooviChargeEvent, [32]byte) (WebhookResult, error)
 }
 
 // MemoryStore supports lightweight handler tests and an explicitly ephemeral demo mode.
@@ -27,6 +28,7 @@ type MemoryStore struct {
 	byOrder map[string]string
 	tokens  map[[32]byte]tokenGrant
 	orders  map[string]int64
+	events  map[[32]byte]WebhookResult
 }
 
 type tokenGrant struct {
@@ -40,6 +42,7 @@ func NewMemoryStore() *MemoryStore {
 		byOrder: make(map[string]string),
 		tokens:  make(map[[32]byte]tokenGrant),
 		orders:  map[string]int64{"demo-order-1": 2599},
+		events:  make(map[[32]byte]WebhookResult),
 	}
 }
 
@@ -74,7 +77,7 @@ func (s *MemoryStore) Create(_ context.Context, orderID string, now time.Time) (
 	if err != nil {
 		return nil, "", false, err
 	}
-	c := &checkout{id: id, tokenHash: sha256.Sum256([]byte(token)), orderID: orderID, amount: amount,
+	c := &checkout{id: id, tokenHash: sha256.Sum256([]byte(token)), orderID: orderID, correlationID: id, amount: amount,
 		status: Pending, expiresAt: now.Add(15 * time.Minute), brCode: "000201-DEMO-PIX-" + id}
 	s.byID[id], s.byOrder[orderID] = c, id
 	s.tokens[c.tokenHash] = tokenGrant{checkoutID: c.id, expiresAt: c.expiresAt.Add(time.Hour)}
@@ -105,6 +108,56 @@ func (s *MemoryStore) SimulatePaid(_ context.Context, id string, _ time.Time) (*
 	// The explicit simulator can model a tardy payment correcting expired to paid.
 	c.status = Paid
 	return c.clone(), nil
+}
+
+func (s *MemoryStore) ApplyChargeEvent(_ context.Context, event WooviChargeEvent, eventHash [32]byte) (WebhookResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.events[eventHash]; exists {
+		return WebhookResult{Duplicate: true}, nil
+	}
+	var matched *checkout
+	for _, c := range s.byID {
+		if c.correlationID == event.Charge.CorrelationID {
+			matched = c
+			break
+		}
+	}
+	if matched != nil && isChargeStateEvent(event.Event) && (event.Charge.Value != matched.amount ||
+		(event.Event == "OPENPIX:CHARGE_COMPLETED" && (event.Charge.Status != "COMPLETED" || event.Pix.Status != "CONFIRMED")) ||
+		(event.Event == "OPENPIX:CHARGE_EXPIRED" && event.Charge.Status != "EXPIRED")) {
+		result := WebhookResult{Rejected: true}
+		s.events[eventHash] = result
+		return result, nil
+	}
+	if matched == nil {
+		result := WebhookResult{Ignored: true}
+		s.events[eventHash] = result
+		return result, nil
+	}
+	switch event.Event {
+	case "OPENPIX:CHARGE_COMPLETED":
+		if matched.status != Paid {
+			matched.status = Paid
+			result := WebhookResult{Applied: true}
+			s.events[eventHash] = result
+			return result, nil
+		}
+	case "OPENPIX:CHARGE_EXPIRED":
+		if matched.status == Pending {
+			matched.status = Expired
+			result := WebhookResult{Applied: true}
+			s.events[eventHash] = result
+			return result, nil
+		}
+	}
+	result := WebhookResult{Ignored: true}
+	s.events[eventHash] = result
+	return result, nil
+}
+
+func isChargeStateEvent(event string) bool {
+	return event == "OPENPIX:CHARGE_COMPLETED" || event == "OPENPIX:CHARGE_EXPIRED"
 }
 
 func (c *checkout) clone() *checkout {

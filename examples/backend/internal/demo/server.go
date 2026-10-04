@@ -24,29 +24,40 @@ const (
 )
 
 type checkout struct {
-	id        string
-	tokenHash [32]byte
-	orderID   string
-	amount    int64
-	status    Status
-	expiresAt time.Time
-	brCode    string
+	id            string
+	tokenHash     [32]byte
+	orderID       string
+	correlationID string
+	amount        int64
+	status        Status
+	expiresAt     time.Time
+	brCode        string
 }
 
 type Server struct {
-	store    CheckoutStore
-	clockNow func() time.Time
+	store        CheckoutStore
+	clockNow     func() time.Time
+	webhookAuth  WebhookVerifier
+	allowDemoPay bool
 }
 
 func NewServer() *Server {
-	return NewServerWithStore(NewMemoryStore(), time.Now)
+	return NewServerWithOptions(NewMemoryStore(), time.Now, nil, true)
 }
 
 func NewServerWithStore(store CheckoutStore, clock func() time.Time) *Server {
+	return NewServerWithOptions(store, clock, nil, false)
+}
+
+func NewServerWithStoreAndWebhookVerifier(store CheckoutStore, clock func() time.Time, verifier WebhookVerifier) *Server {
+	return NewServerWithOptions(store, clock, verifier, false)
+}
+
+func NewServerWithOptions(store CheckoutStore, clock func() time.Time, verifier WebhookVerifier, allowDemoPay bool) *Server {
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Server{store: store, clockNow: clock}
+	return &Server{store: store, clockNow: clock, webhookAuth: verifier, allowDemoPay: allowDemoPay}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -56,7 +67,12 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("POST /v1/checkout-sessions", s.createSession)
 	mux.HandleFunc("GET /v1/checkout-sessions/{id}", s.getStatus)
-	mux.HandleFunc("POST /demo/checkouts/{id}/pay", s.simulatePaid)
+	if s.allowDemoPay {
+		mux.HandleFunc("POST /demo/checkouts/{id}/pay", s.simulatePaid)
+	}
+	if s.webhookAuth != nil {
+		mux.HandleFunc("POST /webhooks/woovi", s.receiveWooviWebhook)
+	}
 	return securityHeaders(mux)
 }
 
@@ -114,6 +130,45 @@ func (s *Server) simulatePaid(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": string(c.status)})
+}
+
+func (s *Server) receiveWooviWebhook(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+	rawBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_payload")
+		return
+	}
+	valid, err := s.webhookAuth.Verify(r.Context(), rawBody, r.Header.Get("x-webhook-signature"))
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "signature_verification_unavailable")
+		return
+	}
+	if !valid {
+		writeError(w, http.StatusUnauthorized, "invalid_signature")
+		return
+	}
+	var event WooviChargeEvent
+	if err := json.Unmarshal(rawBody, &event); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_payload")
+		return
+	}
+	if event.Charge.CorrelationID == "" || len(event.Charge.CorrelationID) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_payload")
+		return
+	}
+	result, err := s.store.ApplyChargeEvent(r.Context(), event, sha256.Sum256(rawBody))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "webhook_processing_failed")
+		return
+	}
+	status := http.StatusOK
+	if result.Rejected {
+		// The signed but inconsistent event is durably quarantined; acknowledging
+		// prevents provider retry storms. Reconciliation must resolve the mismatch.
+		status = http.StatusAccepted
+	}
+	writeJSON(w, status, map[string]any{"received": true, "duplicate": result.Duplicate, "applied": result.Applied, "rejected": result.Rejected})
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {

@@ -20,21 +20,35 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	server := demo.NewServer()
+	var store demo.CheckoutStore = demo.NewMemoryStore()
 	var closeStore func()
 	if databaseURL := os.Getenv("DATABASE_URL"); databaseURL != "" {
-		store, err := demo.OpenPostgres(ctx, databaseURL)
+		postgresStore, err := demo.OpenPostgres(ctx, databaseURL)
 		if err != nil {
 			log.Fatal(err)
 		}
-		server = demo.NewServerWithStore(store, time.Now)
-		closeStore = store.Close
+		store = postgresStore
+		closeStore = postgresStore.Close
 		log.Print("using PostgreSQL checkout store")
 	} else {
 		log.Print("WARNING: DATABASE_URL unset; using ephemeral in-memory demo store")
 	}
 	if closeStore != nil {
 		defer closeStore()
+	}
+	var webhookVerifier demo.WebhookVerifier
+	webhookEnabled := os.Getenv("ENABLE_WOOVI_WEBHOOK") == "true"
+	demoPayEnabled := os.Getenv("ENABLE_DEMO_PSP") == "true"
+	if webhookEnabled && demoPayEnabled {
+		log.Fatal("ENABLE_DEMO_PSP cannot be enabled together with ENABLE_WOOVI_WEBHOOK")
+	}
+	if webhookEnabled {
+		webhookVerifier = demo.NewWooviSignatureVerifier(nil, os.Getenv("WOOVI_WEBHOOK_PUBLIC_KEYS_URL"))
+		log.Print("Woovi charge webhook receiver enabled; order creation remains simulator-only")
+	}
+	server := demo.NewServerWithOptions(store, time.Now, webhookVerifier, demoPayEnabled)
+	if demoPayEnabled {
+		log.Print("WARNING: unauthenticated demo payment route enabled; never expose outside local development")
 	}
 
 	httpServer := &http.Server{

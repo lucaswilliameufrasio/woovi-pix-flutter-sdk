@@ -2,6 +2,7 @@ package demo
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -86,6 +87,78 @@ func TestCreateRejectsClientControlledAmounts(t *testing.T) {
 	if res.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", res.Code)
 	}
+}
+
+func TestDemoPaymentRouteIsDisabledByDefault(t *testing.T) {
+	handler := NewServerWithStore(NewMemoryStore(), time.Now).Handler()
+	request := httptest.NewRequest(http.MethodPost, "/demo/checkouts/does-not-matter/pay", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("demo payment route status = %d, want 404 when disabled", response.Code)
+	}
+}
+
+type testWebhookVerifier struct {
+	valid bool
+	raw   []byte
+}
+
+func (v *testWebhookVerifier) Verify(_ context.Context, raw []byte, _ string) (bool, error) {
+	v.raw = append([]byte(nil), raw...)
+	return v.valid, nil
+}
+
+func TestSignedWebhookAppliesIdempotentlyAndPaidIsTerminal(t *testing.T) {
+	store := NewMemoryStore()
+	verifier := &testWebhookVerifier{}
+	handler := NewServerWithStoreAndWebhookVerifier(store, time.Now, verifier).Handler()
+	created := createCheckout(t, handler, "demo-order-1")
+	var session map[string]any
+	if err := json.Unmarshal(created.Body.Bytes(), &session); err != nil {
+		t.Fatal(err)
+	}
+	id := session["checkout_id"].(string)
+	body := []byte(`{"event":"OPENPIX:CHARGE_COMPLETED","charge":{"correlationID":"` + id + `","status":"COMPLETED","value":2599},"pix":{"status":"CONFIRMED"}}`)
+	verifier.valid = false
+	response := postWebhook(handler, body)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid signature status = %d", response.Code)
+	}
+	verifier.valid = true
+	wrongAmount := bytes.Replace(body, []byte(`"value":2599`), []byte(`"value":1`), 1)
+	response = postWebhook(handler, wrongAmount)
+	if response.Code != http.StatusAccepted || !bytes.Contains(response.Body.Bytes(), []byte(`"rejected":true`)) {
+		t.Fatalf("amount mismatch status = %d, want quarantined 202: %s", response.Code, response.Body.String())
+	}
+	response = postWebhook(handler, body)
+	if response.Code != http.StatusOK || !bytes.Equal(verifier.raw, body) || !bytes.Contains(response.Body.Bytes(), []byte(`"applied":true`)) {
+		t.Fatalf("valid webhook not applied using exact raw body: status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = postWebhook(handler, body)
+	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"duplicate":true`)) {
+		t.Fatalf("duplicate webhook not idempotent: status=%d body=%s", response.Code, response.Body.String())
+	}
+	lateExpired := []byte(`{"event":"OPENPIX:CHARGE_EXPIRED","charge":{"correlationID":"` + id + `","status":"EXPIRED","value":2599}}`)
+	response = postWebhook(handler, lateExpired)
+	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"applied":false`)) {
+		t.Fatalf("out-of-order expired event changed paid state: status=%d body=%s", response.Code, response.Body.String())
+	}
+	statusReq := httptest.NewRequest(http.MethodGet, "/v1/checkout-sessions/"+id, nil)
+	statusReq.Header.Set("Authorization", "Bearer "+session["access_token"].(string))
+	statusRes := httptest.NewRecorder()
+	handler.ServeHTTP(statusRes, statusReq)
+	if !bytes.Contains(statusRes.Body.Bytes(), []byte(`"status":"paid"`)) {
+		t.Fatalf("paid status not retained: %s", statusRes.Body.String())
+	}
+}
+
+func postWebhook(handler http.Handler, body []byte) *httptest.ResponseRecorder {
+	response := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/woovi", bytes.NewReader(body))
+	req.Header.Set("x-webhook-signature", "test-signature")
+	handler.ServeHTTP(response, req)
+	return response
 }
 
 func createCheckout(t *testing.T, h http.Handler, orderID string) *httptest.ResponseRecorder {
