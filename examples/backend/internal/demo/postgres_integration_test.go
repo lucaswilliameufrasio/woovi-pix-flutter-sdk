@@ -390,3 +390,84 @@ func TestPostgresConcurrentChargeReservationsShareOneAttempt(t *testing.T) {
 		t.Fatalf("active PSP attempt rows=%d, want one", count)
 	}
 }
+
+func TestPostgresReconciliationClaimsLeaseAndBackoffRecover(t *testing.T) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("set DATABASE_URL to run PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	store, err := OpenPostgres(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	orderID := "lease-" + time.Now().Format("150405.000000000")
+	if _, err := store.pool.Exec(ctx, `INSERT INTO demo_orders(order_id, amount_cents) VALUES ($1,$2)`, orderID, 912); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.pool.Exec(ctx, `DELETE FROM psp_charge_attempts WHERE order_id=$1`, orderID); err != nil {
+			t.Errorf("cleanup charge attempts: %v", err)
+		}
+		if _, err := store.pool.Exec(ctx, `DELETE FROM demo_orders WHERE order_id=$1`, orderID); err != nil {
+			t.Errorf("cleanup demo order: %v", err)
+		}
+	})
+	now := time.Now().UTC()
+	attempt, err := store.ReserveChargeAttempt(ctx, orderID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkChargeAttemptSubmitting(ctx, attempt.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordChargeAttemptUnknown(ctx, attempt.ID, "timeout", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.ClaimChargeAttemptsForReconciliation(ctx, "worker-1", 10, now.Add(2*time.Second), 30*time.Second)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first lease = %#v err=%v", first, err)
+	}
+	second, err := store.ClaimChargeAttemptsForReconciliation(ctx, "worker-2", 10, now.Add(3*time.Second), 30*time.Second)
+	if err != nil || len(second) != 0 {
+		t.Fatalf("concurrent claim should skip leased row: %#v err=%v", second, err)
+	}
+	if err := store.ScheduleChargeAttemptReconciliationRetry(ctx, attempt.ID, first[0].LeaseToken, "lookup_not_found", now.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	tooSoon, err := store.ClaimChargeAttemptsForReconciliation(ctx, "worker-3", 10, now.Add(8*time.Second), time.Second)
+	if err != nil || len(tooSoon) != 0 {
+		t.Fatalf("claim before backoff elapsed = %#v err=%v", tooSoon, err)
+	}
+	due, err := store.ClaimChargeAttemptsForReconciliation(ctx, "worker-4", 10, now.Add(10*time.Second), time.Second)
+	if err != nil || len(due) != 1 || due[0].ID != attempt.ID {
+		t.Fatalf("claim after backoff = %#v err=%v", due, err)
+	}
+	if err := store.ScheduleChargeAttemptReconciliationRetry(ctx, attempt.ID, first[0].LeaseToken, "stale_worker", now.Add(11*time.Second)); !errors.Is(err, ErrChargeAttemptState) {
+		t.Fatalf("stale worker must not update released lease: %v", err)
+	}
+	if err := store.ScheduleChargeAttemptReconciliationRetry(ctx, attempt.ID, due[0].LeaseToken, "lookup_not_found", now.Add(11*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var attempts int
+	if err := store.pool.QueryRow(ctx, `SELECT reconcile_attempts FROM psp_charge_attempts WHERE attempt_id=$1`, attempt.ID).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("reconcile_attempts=%d, want 2", attempts)
+	}
+	// An abandoned worker's lease expires and becomes claimable after a crash.
+	crashLease, err := store.ClaimChargeAttemptsForReconciliation(ctx, "worker-crashed", 10, now.Add(22*time.Second), time.Second)
+	if err != nil || len(crashLease) != 1 {
+		t.Fatalf("due attempt not claimed: %#v err=%v", crashLease, err)
+	}
+	duplicateCrashClaim, err := store.ClaimChargeAttemptsForReconciliation(ctx, "worker-other", 10, now.Add(22*time.Second), time.Second)
+	if err != nil || len(duplicateCrashClaim) != 0 {
+		t.Fatalf("active lease was claimed twice: %#v err=%v", duplicateCrashClaim, err)
+	}
+	postCrash, err := store.ClaimChargeAttemptsForReconciliation(ctx, "worker-recovered", 10, now.Add(24*time.Second), time.Second)
+	if err != nil || len(postCrash) != 1 {
+		t.Fatalf("expired lease was not recoverable: %#v err=%v", postCrash, err)
+	}
+}

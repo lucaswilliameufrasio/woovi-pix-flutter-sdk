@@ -28,6 +28,7 @@ type ChargeAttempt struct {
 	CorrelationID string
 	AmountCents   int64
 	State         ChargeAttemptState
+	LeaseToken    string
 }
 
 type ChargeCreator interface {
@@ -149,7 +150,7 @@ func (s *PostgresStore) MarkChargeAttemptCreated(ctx context.Context, id string,
 // an uncertain attempt. Any known status resolves the POST ambiguity and keeps
 // the order's active-attempt uniqueness guard in place. It does not create a
 // checkout session or authorize fulfillment.
-func (s *PostgresStore) RecordChargeAttemptReconciliation(ctx context.Context, id string, charge WooviCharge, now time.Time) error {
+func (s *PostgresStore) RecordChargeAttemptReconciliation(ctx context.Context, id, leaseToken string, charge WooviCharge, now time.Time) error {
 	if charge.Status != "ACTIVE" && charge.Status != "COMPLETED" && charge.Status != "EXPIRED" {
 		return ErrChargeAttemptState
 	}
@@ -157,9 +158,11 @@ func (s *PostgresStore) RecordChargeAttemptReconciliation(ctx context.Context, i
 		return ErrChargeAttemptState
 	}
 	tag, err := s.pool.Exec(ctx, `UPDATE psp_charge_attempts
-		SET state='resolved', provider_status=$2, br_code=$3, expires_at=$4, updated_at=$5
-		WHERE attempt_id=$1 AND state IN ('submitting','unknown') AND correlation_id=$6 AND amount_cents=$7`,
-		id, charge.Status, charge.BRCode, charge.ExpiresAt, now, charge.CorrelationID, charge.Value)
+		SET state='resolved', provider_status=$2, br_code=$3, expires_at=$4, updated_at=$5,
+		reconcile_lease_token=NULL, reconcile_lease_until=NULL
+		WHERE attempt_id=$1 AND state IN ('submitting','unknown') AND correlation_id=$6 AND amount_cents=$7
+		AND (($8 = '' AND reconcile_lease_token IS NULL) OR reconcile_lease_token=$8)`,
+		id, charge.Status, charge.BRCode, charge.ExpiresAt, now, charge.CorrelationID, charge.Value, leaseToken)
 	if err != nil {
 		return err
 	}
@@ -184,7 +187,7 @@ func ReconcileChargeAttempt(ctx context.Context, store *PostgresStore, client *W
 	if charge.Value != attempt.AmountCents || charge.CorrelationID != attempt.CorrelationID {
 		return WooviCharge{}, errors.New("woovi lookup did not match reserved amount and correlationID")
 	}
-	if err := store.RecordChargeAttemptReconciliation(ctx, attempt.ID, charge, now); err != nil {
+	if err := store.RecordChargeAttemptReconciliation(ctx, attempt.ID, attempt.LeaseToken, charge, now); err != nil {
 		return WooviCharge{}, err
 	}
 	return charge, nil
@@ -201,7 +204,11 @@ type ChargeReconciliationOutcome struct {
 // without stopping later work or changing the attempt's durable unknown state.
 // A scheduler can invoke this with a bounded frequency once operations are set.
 func ReconcilePendingChargeAttempts(ctx context.Context, store *PostgresStore, client *WooviChargeClient, limit int, now time.Time) ([]ChargeReconciliationOutcome, error) {
-	attempts, err := store.ListChargeAttemptsNeedingReconciliation(ctx, limit)
+	workerToken, err := randomHex(16)
+	if err != nil {
+		return nil, err
+	}
+	attempts, err := store.ClaimChargeAttemptsForReconciliation(ctx, workerToken, limit, now, 30*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -211,6 +218,12 @@ func ReconcilePendingChargeAttempts(ctx context.Context, store *PostgresStore, c
 			return outcomes, err
 		}
 		charge, err := ReconcileChargeAttempt(ctx, store, client, attempt, now)
+		if err != nil {
+			retryErr := store.ScheduleChargeAttemptReconciliationRetry(ctx, attempt.ID, attempt.LeaseToken, "reconciliation_failed", now)
+			if retryErr != nil {
+				err = errors.Join(err, retryErr)
+			}
+		}
 		outcome := ChargeReconciliationOutcome{AttemptID: attempt.ID, Err: err}
 		if err == nil {
 			outcome.Charge = &charge
@@ -218,6 +231,70 @@ func ReconcilePendingChargeAttempts(ctx context.Context, store *PostgresStore, c
 		outcomes = append(outcomes, outcome)
 	}
 	return outcomes, nil
+}
+
+func (s *PostgresStore) ClaimChargeAttemptsForReconciliation(ctx context.Context, workerToken string, limit int, now time.Time, lease time.Duration) ([]ChargeAttempt, error) {
+	if workerToken == "" || len(workerToken) > 128 || limit < 1 || limit > 500 || lease <= 0 || lease > 5*time.Minute {
+		return nil, errors.New("invalid reconciliation claim parameters")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	rows, err := tx.Query(ctx, `WITH candidates AS (
+		SELECT attempt_id FROM psp_charge_attempts
+		WHERE state IN ('submitting','unknown') AND next_reconcile_at <= $1
+		  AND (reconcile_lease_until IS NULL OR reconcile_lease_until <= $1)
+		ORDER BY next_reconcile_at, updated_at
+		LIMIT $2 FOR UPDATE SKIP LOCKED
+	)
+	UPDATE psp_charge_attempts AS attempts
+	SET reconcile_lease_token=$3, reconcile_lease_until=$4
+	FROM candidates WHERE attempts.attempt_id=candidates.attempt_id
+	RETURNING attempts.attempt_id, attempts.order_id, attempts.correlation_id, attempts.amount_cents, attempts.state`,
+		now, limit, workerToken, now.Add(lease))
+	if err != nil {
+		return nil, err
+	}
+	var attempts []ChargeAttempt
+	for rows.Next() {
+		var attempt ChargeAttempt
+		if err := rows.Scan(&attempt.ID, &attempt.OrderID, &attempt.CorrelationID, &attempt.AmountCents, &attempt.State); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		attempt.LeaseToken = workerToken
+		attempts = append(attempts, attempt)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return attempts, nil
+}
+
+func (s *PostgresStore) ScheduleChargeAttemptReconciliationRetry(ctx context.Context, id, leaseToken, safeErrorCode string, now time.Time) error {
+	if id == "" || leaseToken == "" || len(safeErrorCode) == 0 || len(safeErrorCode) > 64 {
+		return errors.New("invalid reconciliation retry parameters")
+	}
+	result, err := s.pool.Exec(ctx, `UPDATE psp_charge_attempts
+		SET reconcile_attempts=reconcile_attempts+1,
+		    next_reconcile_at=$3::timestamptz + (LEAST(3600, (5 * power(2, LEAST(reconcile_attempts, 10)))::int) * INTERVAL '1 second'),
+		    last_reconcile_error=$4, reconcile_lease_token=NULL, reconcile_lease_until=NULL, updated_at=$3
+		WHERE attempt_id=$1 AND state IN ('submitting','unknown') AND reconcile_lease_token=$2`,
+		id, leaseToken, now, safeErrorCode)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return ErrChargeAttemptState
+	}
+	return nil
 }
 
 func (s *PostgresStore) ListChargeAttemptsNeedingReconciliation(ctx context.Context, limit int) ([]ChargeAttempt, error) {
