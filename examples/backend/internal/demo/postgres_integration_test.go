@@ -270,33 +270,57 @@ func TestPostgresAmbiguousChargeCanOnlyResolveThroughLookup(t *testing.T) {
 	}
 	attempt.State = ChargeAttemptUnknown // a restarted worker loads this state from the recovery queue
 	lookups := 0
+	responseMode := "not-found"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		lookups++
 		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/charge/"+attempt.CorrelationID {
 			t.Errorf("lookup request %s %s", r.Method, r.URL.Path)
 		}
-		_, _ = w.Write([]byte(`{"charge":{"correlationID":"` + attempt.CorrelationID + `","value":3210,"status":"ACTIVE","brCode":"pix-reconciled","expiresDate":"` + now.Add(15*time.Minute).Format(time.RFC3339) + `"}}`))
+		switch responseMode {
+		case "not-found":
+			w.WriteHeader(http.StatusNotFound)
+		case "mismatch":
+			_, _ = w.Write([]byte(`{"charge":{"correlationID":"` + attempt.CorrelationID + `","value":1,"status":"ACTIVE","brCode":"pix-reconciled","expiresDate":"` + now.Add(15*time.Minute).Format(time.RFC3339) + `"}}`))
+		default:
+			_, _ = w.Write([]byte(`{"charge":{"correlationID":"` + attempt.CorrelationID + `","value":3210,"status":"ACTIVE","brCode":"pix-reconciled","expiresDate":"` + now.Add(15*time.Minute).Format(time.RFC3339) + `"}}`))
+		}
 	}))
 	defer server.Close()
 	client, err := NewWooviChargeClient("fixture-app-id", server.URL, server.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
-	charge, err := ReconcileChargeAttempt(ctx, store, client, attempt, now.Add(3*time.Second))
+	if _, err := ReconcileChargeAttempt(ctx, store, client, attempt, now.Add(3*time.Second)); err == nil {
+		t.Fatal("not-found lookup must remain unresolved")
+	}
+	var state string
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM psp_charge_attempts WHERE attempt_id=$1`, attempt.ID).Scan(&state); err != nil || state != string(ChargeAttemptUnknown) {
+		t.Fatalf("404 changed attempt state to %q: %v", state, err)
+	}
+	responseMode = "mismatch"
+	if _, err := ReconcileChargeAttempt(ctx, store, client, attempt, now.Add(4*time.Second)); err == nil {
+		t.Fatal("amount mismatch must remain unresolved")
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM psp_charge_attempts WHERE attempt_id=$1`, attempt.ID).Scan(&state); err != nil || state != string(ChargeAttemptUnknown) {
+		t.Fatalf("mismatched response changed attempt state to %q: %v", state, err)
+	}
+	responseMode = "active"
+	charge, err := ReconcileChargeAttempt(ctx, store, client, attempt, now.Add(5*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lookups != 1 || charge.Status != "ACTIVE" || charge.Value != attempt.AmountCents {
+	if lookups != 3 || charge.Status != "ACTIVE" || charge.Value != attempt.AmountCents {
 		t.Fatalf("lookup count=%d charge=%#v", lookups, charge)
 	}
-	var state, providerStatus string
+	var providerStatus string
 	if err := store.pool.QueryRow(ctx, `SELECT state, provider_status FROM psp_charge_attempts WHERE attempt_id=$1`, attempt.ID).Scan(&state, &providerStatus); err != nil {
 		t.Fatal(err)
 	}
 	if state != string(ChargeAttemptResolved) || providerStatus != "ACTIVE" {
 		t.Fatalf("persisted reconciliation state=%s provider_status=%s", state, providerStatus)
 	}
-	if _, err := ReconcileChargeAttempt(ctx, store, client, attempt, now.Add(4*time.Second)); !errors.Is(err, ErrChargeAttemptState) {
+	attempt.State = ChargeAttemptResolved
+	if _, err := ReconcileChargeAttempt(ctx, store, client, attempt, now.Add(6*time.Second)); !errors.Is(err, ErrChargeAttemptState) {
 		t.Fatalf("resolved attempt must not be reconciled/posted as unknown again: %v", err)
 	}
 }
