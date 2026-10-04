@@ -458,13 +458,17 @@ func TestPostgresChargeSubmissionOrchestrationPostsAtMostOnce(t *testing.T) {
 	t.Cleanup(store.Close)
 	concurrentOrder := "orchestrated-race-" + time.Now().Format("150405.000000000")
 	failingOrder := "orchestrated-fail-" + time.Now().Format("150405.000000000")
-	for i, orderID := range []string{concurrentOrder, failingOrder} {
+	webhookRaceOrder := "orchestrated-webhook-race-" + time.Now().Format("150405.000000000")
+	for i, orderID := range []string{concurrentOrder, failingOrder, webhookRaceOrder} {
 		if _, err := store.pool.Exec(ctx, `INSERT INTO demo_orders(order_id, amount_cents) VALUES ($1, $2)`, orderID, 8701+int64(i)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	t.Cleanup(func() {
-		for _, orderID := range []string{concurrentOrder, failingOrder} {
+		for _, orderID := range []string{concurrentOrder, failingOrder, webhookRaceOrder} {
+			if _, err := store.pool.Exec(ctx, `DELETE FROM webhook_events WHERE correlation_id IN (SELECT correlation_id FROM psp_charge_attempts WHERE order_id=$1)`, orderID); err != nil {
+				t.Errorf("cleanup webhook events: %v", err)
+			}
 			if _, err := store.pool.Exec(ctx, `DELETE FROM psp_charge_attempts WHERE order_id=$1`, orderID); err != nil {
 				t.Errorf("cleanup charge attempts: %v", err)
 			}
@@ -497,6 +501,18 @@ func TestPostgresChargeSubmissionOrchestrationPostsAtMostOnce(t *testing.T) {
 		if request.Value == 8702 {
 			w.WriteHeader(http.StatusBadGateway)
 			return
+		}
+		if request.Value == 8703 {
+			event := WooviChargeEvent{Event: "OPENPIX:CHARGE_COMPLETED"}
+			event.Charge.CorrelationID = request.CorrelationID
+			event.Charge.Value = request.Value
+			event.Charge.Status = "COMPLETED"
+			event.Pix.Status = "CONFIRMED"
+			if _, err := store.ApplyChargeEvent(r.Context(), event, sha256.Sum256([]byte("response-race-"+request.CorrelationID))); err != nil {
+				t.Errorf("apply early completion webhook: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"charge":{"correlationID":"` + request.CorrelationID + `","status":"ACTIVE","brCode":"orchestrated-pix","expiresDate":"` + now.Add(15*time.Minute).Format(time.RFC3339) + `"}}`))
@@ -551,10 +567,24 @@ func TestPostgresChargeSubmissionOrchestrationPostsAtMostOnce(t *testing.T) {
 	if _, _, retryErr := SubmitChargeForOrder(ctx, store, client, failingOrder, now.Add(time.Second)); !errors.Is(retryErr, ErrChargeAttemptState) {
 		t.Fatalf("unknown attempt must not be posted again: %v", retryErr)
 	}
+	responseRace, responseCharge, responseRaceErr := SubmitChargeForOrder(ctx, store, client, webhookRaceOrder, now)
+	if !errors.Is(responseRaceErr, ErrChargeAttemptState) || responseRace.State != ChargeAttemptSubmitting || responseCharge.Status != "ACTIVE" {
+		t.Fatalf("POST response racing terminal webhook attempt=%#v charge=%#v err=%v", responseRace, responseCharge, responseRaceErr)
+	}
+	if _, _, retryErr := SubmitChargeForOrder(ctx, store, client, webhookRaceOrder, now.Add(time.Second)); retryErr == nil {
+		t.Fatal("order resolved paid by webhook must not permit a second POST")
+	}
+	var finalState, finalProviderStatus string
+	if err := store.pool.QueryRow(ctx, `SELECT state, provider_status FROM psp_charge_attempts WHERE attempt_id=$1`, responseRace.ID).Scan(&finalState, &finalProviderStatus); err != nil {
+		t.Fatal(err)
+	}
+	if finalState != string(ChargeAttemptResolved) || finalProviderStatus != "COMPLETED" {
+		t.Fatalf("webhook/POST-response race ended in %s/%s", finalState, finalProviderStatus)
+	}
 	mu.Lock()
 	defer mu.Unlock()
-	if postCount != 2 {
-		t.Fatalf("PSP fixture received %d POSTs, want exactly one per order (2 total)", postCount)
+	if postCount != 3 {
+		t.Fatalf("PSP fixture received %d POSTs, want exactly one per order (3 total)", postCount)
 	}
 	var state string
 	if err := store.pool.QueryRow(ctx, `SELECT state FROM psp_charge_attempts WHERE attempt_id=$1`, winningAttempt.ID).Scan(&state); err != nil || state != string(ChargeAttemptCreated) {
