@@ -45,6 +45,7 @@ type Server struct {
 	webhookAuth      WebhookVerifier
 	allowDemoPay     bool
 	merchantCheckout *merchantCheckoutService
+	sandboxLookup    *WooviChargeClient
 }
 
 func NewServer() *Server {
@@ -71,7 +72,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("POST "+apiCheckoutSessionsPath, s.createSession)
+	if s.sandboxLookup == nil {
+		mux.HandleFunc("POST "+apiCheckoutSessionsPath, s.createSession)
+	}
 	if s.merchantCheckout != nil {
 		mux.HandleFunc("POST /v1/merchant/checkout-sessions", s.createMerchantCheckout)
 	}
@@ -183,8 +186,12 @@ func (s *Server) createMerchantCheckout(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	if attempt.State == ChargeAttemptSubmitting || attempt.State == ChargeAttemptUnknown {
-		writeAPIError(w, apiConflict("PAYMENT_PROCESSING", "O pagamento está sendo confirmado; repita a consulta com a mesma chave de idempotência"))
-		return
+		if s.sandboxLookup != nil && s.reconcileSandboxAttempt(r.Context(), attempt) == nil {
+			attempt.State = ChargeAttemptResolved
+		} else {
+			writeAPIError(w, apiConflict("PAYMENT_PROCESSING", "O pagamento está sendo confirmado; repita a consulta com a mesma chave de idempotência"))
+			return
+		}
 	}
 	c, token, created, sessionErr := s.merchantCheckout.store.CreateCheckoutForChargeAttempt(r.Context(), attempt.ID, s.clockNow())
 	if errors.Is(sessionErr, ErrChargeInProgress) {
@@ -253,6 +260,17 @@ func (s *Server) getStatus(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeAPIError(w, unexpectedError())
 		return
+	}
+	if s.sandboxLookup != nil && c.orderID == "sandbox-order-1" && c.status != Paid {
+		if err := s.refreshSandboxSession(r.Context(), c); err != nil {
+			writeAPIError(w, dependencyError("PAYMENT_PROCESSING", "Não foi possível consultar o pagamento", "CHARGE_LOOKUP_FAILED"))
+			return
+		}
+		c, err = s.store.Status(r.Context(), r.PathValue("id"), tokenHash, s.clockNow())
+		if err != nil {
+			writeAPIError(w, unexpectedError())
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": c.status, "expires_at": c.expiresAt.UTC().Format(time.RFC3339)})
 }

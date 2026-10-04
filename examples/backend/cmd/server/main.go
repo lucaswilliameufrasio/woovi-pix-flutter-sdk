@@ -45,7 +45,7 @@ func main() {
 	}
 	if webhookEnabled {
 		webhookVerifier = demo.NewWooviSignatureVerifier(nil, os.Getenv("WOOVI_WEBHOOK_PUBLIC_KEYS_URL"))
-		log.Print("Woovi charge webhook receiver enabled; order creation remains simulator-only")
+		log.Print("Woovi charge webhook receiver enabled")
 	}
 	var reconciliationWorker *demo.ChargeReconciliationWorker
 	if os.Getenv("ENABLE_WOOVI_RECONCILIATION") == "true" {
@@ -103,6 +103,18 @@ func main() {
 		log.Printf("Woovi charge reconciliation enabled (GET-only; interval=%s batch=%d)", interval, batchSize)
 	}
 	server := demo.NewServerWithOptions(store, time.Now, webhookVerifier, demoPayEnabled)
+	if os.Getenv("ENABLE_WOOVI_SANDBOX_CHECKOUT") == "true" {
+		if os.Getenv("ENABLE_WOOVI_RECONCILIATION") == "true" {
+			log.Fatal("sandbox example uses GET-only replay/status polling; disable the independent reconciliation worker")
+		}
+		if webhookEnabled && os.Getenv("WOOVI_WEBHOOK_PUBLIC_KEYS_URL") != demo.SandboxAPIBaseURL+"/api/v1/webhook/public-keys" {
+			log.Fatal("sandbox webhook requires sandbox public keys URL")
+		}
+		if err := server.ConfigureSandboxCheckout(ctx, os.Getenv("SANDBOX_SESSION_TOKEN"), os.Getenv("WOOVI_APP_ID"), os.Getenv("WOOVI_API_BASE_URL"), demoPayEnabled); err != nil {
+			log.Fatal(err)
+		}
+		log.Print("WARNING: sandbox checkout enabled; fixed test order and test-session auth, not production")
+	}
 	if demoPayEnabled {
 		log.Print("WARNING: unauthenticated demo payment route enabled; never expose outside local development")
 	}
@@ -127,7 +139,7 @@ func main() {
 			}
 		}()
 	}
-	log.Printf("demo merchant backend (simulated PSP) listening on %s", addr)
+	log.Printf("example merchant backend listening on %s", addr)
 	listenErr := httpServer.ListenAndServe()
 	stop()
 	if workerDone != nil {

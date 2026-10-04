@@ -238,7 +238,7 @@ func (s *PostgresStore) CreateCheckoutForChargeAttempt(ctx context.Context, atte
 		} else {
 			c.expiresAt = now
 		}
-	case attempt.State == ChargeAttemptCreated && providerStatus == "ACTIVE" && brCode != "" && chargeExpiresAt.Valid:
+	case (attempt.State == ChargeAttemptCreated || attempt.State == ChargeAttemptResolved) && providerStatus == "ACTIVE" && brCode != "" && chargeExpiresAt.Valid:
 		c.status, c.expiresAt = Pending, chargeExpiresAt.Time
 		if !now.Before(c.expiresAt) {
 			c.status = Expired

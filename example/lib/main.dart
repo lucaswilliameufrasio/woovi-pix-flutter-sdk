@@ -27,6 +27,10 @@ class OrderPage extends StatefulWidget {
 }
 
 class _OrderPageState extends State<OrderPage> {
+  static const _sandbox = bool.fromEnvironment('WOOVI_SANDBOX');
+  static const _sandboxToken = String.fromEnvironment('SANDBOX_SESSION_TOKEN');
+  static const _idempotencyKey =
+      String.fromEnvironment('SANDBOX_IDEMPOTENCY_KEY');
   static const _configuredBackend = String.fromEnvironment('DEMO_BACKEND');
   static String get _backend => _configuredBackend.isNotEmpty
       ? _configuredBackend
@@ -41,10 +45,24 @@ class _OrderPageState extends State<OrderPage> {
       _error = null;
     });
     try {
+      if (_sandbox &&
+          (_sandboxToken.length < 32 ||
+              _idempotencyKey.length < 8 ||
+              _idempotencyKey.length > 128)) {
+        throw StateError(
+            'Configure SANDBOX_SESSION_TOKEN e SANDBOX_IDEMPOTENCY_KEY; preserve a chave após erros e reinícios.');
+      }
       final response = await http
-          .post(Uri.parse('$_backend/v1/checkout-sessions'),
-              headers: {'Content-Type': 'application/json'},
-              body: jsonEncode({'order_id': 'demo-order-1'}))
+          .post(
+              Uri.parse(
+                  '$_backend/v1/${_sandbox ? 'merchant/' : ''}checkout-sessions'),
+              headers: {
+                'Content-Type': 'application/json',
+                if (_sandbox) 'X-Sandbox-Session': _sandboxToken,
+                if (_sandbox) 'Idempotency-Key': _idempotencyKey
+              },
+              body: jsonEncode(
+                  {'order_id': _sandbox ? 'sandbox-order-1' : 'demo-order-1'}))
           .timeout(const Duration(seconds: 10));
       if (response.statusCode != 200 && response.statusCode != 201) {
         Object? decodedError;
@@ -103,11 +121,14 @@ class _OrderPageState extends State<OrderPage> {
                 child: ListTile(
                     leading: Icon(Icons.inventory_2),
                     title: Text('Caneca fictícia'),
-                    subtitle: Text('Pedido demo-order-1 · R\$ 25,99'))),
+                    subtitle: Text(_sandbox
+                        ? 'Pedido sandbox-order-1 · R\$ 25,99'
+                        : 'Pedido demo-order-1 · R\$ 25,99'))),
             const SizedBox(height: 16),
             if (_controller == null) ...[
-              const Text(
-                  'Exemplo local com um PSP simulado. Nenhuma cobrança real será criada.'),
+              const Text(_sandbox
+                  ? 'Woovi sandbox: somente conta e credenciais de teste. Não pague com banco real.'
+                  : 'Exemplo local com um PSP simulado. Nenhuma cobrança real será criada.'),
               FilledButton(
                   onPressed: _loading ? null : _startCheckout,
                   child: Text(_loading ? 'Carregando…' : 'Pagar com Pix')),
@@ -125,8 +146,9 @@ class _OrderPageState extends State<OrderPage> {
                 ),
               ),
               const SizedBox(height: 24),
-              const Text(
-                  'Para simular o pagamento, envie POST /v1/demo/checkouts/{checkout_id}/pay ao backend local.'),
+              const Text(_sandbox
+                  ? 'Simule o pagamento na conta de teste Woovi; o backend consulta o status via GET.'
+                  : 'Para simular o pagamento, envie POST /v1/demo/checkouts/{checkout_id}/pay ao backend local.'),
             ],
           ],
         ),
