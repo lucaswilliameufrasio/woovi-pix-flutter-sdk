@@ -22,6 +22,25 @@ const (
 
 var ErrChargeAttemptState = errors.New("invalid charge attempt state transition")
 
+// MergeProviderChargeStatus prevents a delayed ACTIVE/EXPIRED observation from
+// downgrading a terminal payment result. COMPLETED is financially authoritative
+// and therefore wins regardless of observation order.
+func MergeProviderChargeStatus(current, observed string) (string, error) {
+	valid := func(status string) bool {
+		return status == "" || status == "ACTIVE" || status == "EXPIRED" || status == "COMPLETED"
+	}
+	if !valid(current) || !valid(observed) || observed == "" {
+		return "", ErrChargeAttemptState
+	}
+	if current == "COMPLETED" || observed == "COMPLETED" {
+		return "COMPLETED", nil
+	}
+	if current == "EXPIRED" || observed == "EXPIRED" {
+		return "EXPIRED", nil
+	}
+	return "ACTIVE", nil
+}
+
 type ChargeAttempt struct {
 	ID            string
 	OrderID       string
@@ -151,14 +170,19 @@ func (s *PostgresStore) MarkChargeAttemptCreated(ctx context.Context, id string,
 // the order's active-attempt uniqueness guard in place. It does not create a
 // checkout session or authorize fulfillment.
 func (s *PostgresStore) RecordChargeAttemptReconciliation(ctx context.Context, id, leaseToken string, charge WooviCharge, now time.Time) error {
-	if charge.Status != "ACTIVE" && charge.Status != "COMPLETED" && charge.Status != "EXPIRED" {
+	if _, err := MergeProviderChargeStatus("", charge.Status); err != nil {
 		return ErrChargeAttemptState
 	}
 	if charge.Status == "ACTIVE" && (charge.BRCode == "" || !charge.ExpiresAt.After(now)) {
 		return ErrChargeAttemptState
 	}
 	tag, err := s.pool.Exec(ctx, `UPDATE psp_charge_attempts
-		SET state='resolved', provider_status=$2, br_code=$3, expires_at=$4, updated_at=$5,
+		SET state='resolved', provider_status=CASE
+			WHEN provider_status='COMPLETED' OR $2='COMPLETED' THEN 'COMPLETED'
+			WHEN provider_status='EXPIRED' OR $2='EXPIRED' THEN 'EXPIRED'
+			ELSE 'ACTIVE' END,
+			br_code=CASE WHEN $2='ACTIVE' THEN $3 ELSE br_code END,
+			expires_at=CASE WHEN $2='ACTIVE' THEN $4 ELSE expires_at END, updated_at=$5,
 		reconcile_lease_token=NULL, reconcile_lease_until=NULL
 		WHERE attempt_id=$1 AND state IN ('submitting','unknown') AND correlation_id=$6 AND amount_cents=$7
 		AND (($8 = '' AND reconcile_lease_token IS NULL) OR reconcile_lease_token=$8)`,
