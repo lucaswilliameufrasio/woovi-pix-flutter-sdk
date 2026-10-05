@@ -9,6 +9,26 @@ Install the pinned versions first:
 mise install
 ```
 
+## CI and reproducible commands
+
+The [Quality](../../.github/workflows/quality.yml) workflow runs the gates on pushes
+to `main` and pull requests, using the mise versions and Compose PostgreSQL image.
+Actions are pinned to commits, with read-only permissions and no Woovi credentials.
+There is no deployment or package/APK publication.
+
+Use the same scripts locally:
+
+```sh
+bash scripts/check-flutter.sh package
+bash scripts/check-flutter.sh example
+```
+
+The example script builds debug APKs in default and sandbox modes, without real tokens.
+Both scripts enforce dependency lockfiles. For the backend, prepare the database
+as described below and run `bash scripts/check-backend.sh` from the root with
+`DATABASE_URL` exported and `golangci-lint` **2.14.0** installed. This gate fails
+if the variable is missing or any test is skipped.
+
 ## Flutter package
 
 ```sh
@@ -98,5 +118,5 @@ Data remains in the volume; do not delete it without confirming it can be discar
 - Formatting, lint, tests, and builds must pass before committing.
 - Skipped integration tests do not count as validation.
 - Local checks do not replace iOS or real sandbox validation.
-- The repository has no CI workflow yet; these checks are manual.
+- The CI workflow repeats local gates; check its remote execution after pushing.
 - Local conventions and skills are listed in [AGENTS.md](../../AGENTS.md).

@@ -42,6 +42,7 @@ as verificações locais usam a versão fixada.
 | Quero… | Guia |
 | --- | --- |
 | Executar e confirmar um pagamento fictício | [Demonstração local](docs/pt-br/demo.md) |
+| Integrar a interface e gerenciar os recursos do SDK | [Checkout Flutter](docs/pt-br/flutter.md) |
 | Criar uma cobrança na conta de teste Woovi | [Sandbox](docs/pt-br/sandbox.md) |
 | Entender a API, idempotência e segurança | [Contrato do backend](docs/pt-br/backend.md) |
 | Rodar formatação, lint, testes e builds | [Desenvolvimento](docs/pt-br/development.md) |

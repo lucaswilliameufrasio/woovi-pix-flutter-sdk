@@ -42,6 +42,7 @@ support; local checks use the pinned version.
 | I want to… | Guide |
 | --- | --- |
 | Run and confirm a fictional payment | [Local demo](docs/en-us/demo.md) |
+| Integrate the UI and manage SDK resources | [Flutter checkout](docs/en-us/flutter.md) |
 | Create a charge in a Woovi test account | [Sandbox](docs/en-us/sandbox.md) |
 | Understand the API, idempotency, and security | [Backend contract](docs/en-us/backend.md) |
 | Run formatting, lint, tests, and builds | [Development](docs/en-us/development.md) |

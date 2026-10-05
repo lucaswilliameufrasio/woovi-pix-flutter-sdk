@@ -9,6 +9,26 @@ Instale as versões fixadas antes de começar:
 mise install
 ```
 
+## CI e comandos reproduzíveis
+
+O workflow [Quality](../../.github/workflows/quality.yml) executa os gates em pushes
+para `main` e pull requests, com as versões do mise e PostgreSQL do Compose.
+As actions são fixadas por commit, com permissão somente de leitura e sem
+credenciais Woovi. Não há deploy nem publicação de pacote ou APK.
+
+Use os mesmos scripts localmente:
+
+```sh
+bash scripts/check-flutter.sh package
+bash scripts/check-flutter.sh example
+```
+
+O script do exemplo compila APKs debug nos modos padrão e sandbox, sem tokens reais.
+Ambos os scripts exigem os lockfiles de dependências. Para o backend, prepare o
+banco como descrito abaixo e execute `bash scripts/check-backend.sh` na raiz com
+`DATABASE_URL` exportada e `golangci-lint` **2.14.0** instalado. Esse gate falha
+se a variável estiver ausente ou se algum teste for pulado.
+
 ## Pacote Flutter
 
 ```sh
@@ -98,5 +118,5 @@ Os dados permanecem no volume; não o apague sem confirmar que pode ser descarta
 - Formatação, lint, testes e builds precisam passar antes do commit.
 - Testes de integração pulados não contam como validação.
 - Checks locais não substituem validação de iOS ou do sandbox real.
-- O repositório ainda não tem workflow de CI; estas verificações são manuais.
+- O workflow de CI repete os gates locais; sua execução remota deve ser conferida após o push.
 - As convenções e skills locais estão em [AGENTS.md](../../AGENTS.md).

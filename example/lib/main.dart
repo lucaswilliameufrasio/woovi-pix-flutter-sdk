@@ -26,6 +26,29 @@ class OrderPage extends StatefulWidget {
   State<OrderPage> createState() => _OrderPageState();
 }
 
+sealed class _OrderState {
+  const _OrderState();
+}
+
+final class _OrderIdle extends _OrderState {
+  const _OrderIdle();
+}
+
+final class _OrderLoading extends _OrderState {
+  const _OrderLoading();
+}
+
+final class _OrderError extends _OrderState {
+  const _OrderError(this.message);
+  final String message;
+}
+
+final class _OrderCheckout extends _OrderState {
+  const _OrderCheckout(this.controller, this.transport);
+  final CheckoutController controller;
+  final HttpCheckoutTransport transport;
+}
+
 class _OrderPageState extends State<OrderPage> {
   static const _sandbox = bool.fromEnvironment('WOOVI_SANDBOX');
   static const _sandboxToken = String.fromEnvironment('SANDBOX_SESSION_TOKEN');
@@ -35,15 +58,14 @@ class _OrderPageState extends State<OrderPage> {
   static String get _backend => _configuredBackend.isNotEmpty
       ? _configuredBackend
       : (Platform.isAndroid ? 'http://10.0.2.2:8080' : 'http://127.0.0.1:8080');
-  CheckoutController? _controller;
-  bool _loading = false;
-  String? _error;
+  final _client = http.Client();
+  _OrderState _state = const _OrderIdle();
 
   Future<void> _startCheckout() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+    if (_state is _OrderLoading || _state is _OrderCheckout) {
+      return;
+    }
+    setState(() => _state = const _OrderLoading());
     try {
       if (_sandbox &&
           (_sandboxToken.length < 32 ||
@@ -52,7 +74,7 @@ class _OrderPageState extends State<OrderPage> {
         throw StateError(
             'Configure SANDBOX_SESSION_TOKEN e SANDBOX_IDEMPOTENCY_KEY; preserve a chave após erros e reinícios.');
       }
-      final response = await http
+      final response = await _client
           .post(
               Uri.parse(
                   '$_backend/v1/${_sandbox ? 'merchant/' : ''}checkout-sessions'),
@@ -86,28 +108,31 @@ class _OrderPageState extends State<OrderPage> {
         throw const FormatException('Invalid backend response');
       }
       final session = CheckoutSession.fromJson(body);
-      final controller = CheckoutController(
-        session: session,
-        transport: HttpCheckoutTransport(baseUrl: Uri.parse(_backend)),
-      );
       if (!mounted) {
-        controller.dispose();
         return;
       }
-      _controller?.dispose();
-      setState(() => _controller = controller);
+      final transport =
+          HttpCheckoutTransport(baseUrl: Uri.parse(_backend), client: _client);
+      final controller = CheckoutController(
+        session: session,
+        transport: transport,
+      );
+      setState(() => _state = _OrderCheckout(controller, transport));
     } catch (error) {
       if (mounted) {
-        setState(() => _error = 'Não foi possível iniciar o checkout: $error');
+        setState(() => _state =
+            _OrderError('Não foi possível iniciar o checkout: $error'));
       }
-    } finally {
-      if (mounted) setState(() => _loading = false);
     }
   }
 
   @override
   void dispose() {
-    _controller?.dispose();
+    if (_state case _OrderCheckout(:final controller, :final transport)) {
+      controller.dispose();
+      transport.close();
+    }
+    _client.close();
     super.dispose();
   }
 
@@ -125,20 +150,9 @@ class _OrderPageState extends State<OrderPage> {
                         ? 'Pedido sandbox-order-1 · R\$ 25,99'
                         : 'Pedido demo-order-1 · R\$ 25,99'))),
             const SizedBox(height: 16),
-            if (_controller == null) ...[
-              const Text(_sandbox
-                  ? 'Woovi sandbox: somente conta e credenciais de teste. Não pague com banco real.'
-                  : 'Exemplo local com um PSP simulado. Nenhuma cobrança real será criada.'),
-              FilledButton(
-                  onPressed: _loading ? null : _startCheckout,
-                  child: Text(_loading ? 'Carregando…' : 'Pagar com Pix')),
-              if (_error != null)
-                Text(_error!,
-                    style:
-                        TextStyle(color: Theme.of(context).colorScheme.error)),
-            ] else ...[
+            if (_state case _OrderCheckout(:final controller)) ...[
               PixCheckoutView(
-                controller: _controller!,
+                controller: controller,
                 onPaid: () => ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(
                       content: Text(
@@ -149,6 +163,19 @@ class _OrderPageState extends State<OrderPage> {
               const Text(_sandbox
                   ? 'Simule o pagamento na conta de teste Woovi; o backend consulta o status via GET.'
                   : 'Para simular o pagamento, envie POST /v1/demo/checkouts/{checkout_id}/pay ao backend local.'),
+            ] else ...[
+              const Text(_sandbox
+                  ? 'Woovi sandbox: somente conta e credenciais de teste. Não pague com banco real.'
+                  : 'Exemplo local com um PSP simulado. Nenhuma cobrança real será criada.'),
+              FilledButton(
+                  onPressed: _state is _OrderLoading ? null : _startCheckout,
+                  child: Text(_state is _OrderLoading
+                      ? 'Carregando…'
+                      : 'Pagar com Pix')),
+              if (_state case _OrderError(:final message))
+                Text(message,
+                    style:
+                        TextStyle(color: Theme.of(context).colorScheme.error)),
             ],
           ],
         ),

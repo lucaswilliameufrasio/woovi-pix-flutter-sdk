@@ -17,7 +17,9 @@ void main() {
   testWidgets('sandbox missing config is rejected before network access',
       (tester) async {
     const sandbox = bool.fromEnvironment('WOOVI_SANDBOX');
-    if (!sandbox) return;
+    if (!sandbox) {
+      return;
+    }
     await tester.pumpWidget(const DemoApp());
     await tester.tap(find.text('Pagar com Pix'));
     await tester.pumpAndSettle();

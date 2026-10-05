@@ -1,3 +1,6 @@
+import 'dart:async';
+
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:woovi_pix_flutter/woovi_pix_flutter.dart';
 
@@ -8,9 +11,22 @@ class _SequenceTransport implements CheckoutTransport {
   @override
   Future<CheckoutSnapshot> fetchStatus(CheckoutSession session) async {
     final result = results.removeAt(0);
-    if (result is Exception) throw result;
+    if (result is Exception) {
+      throw result;
+    }
     return CheckoutSnapshot(
         status: result as CheckoutStatus, expiresAt: session.expiresAt);
+  }
+}
+
+class _PendingTransport implements CheckoutTransport {
+  final response = Completer<CheckoutSnapshot>();
+  int calls = 0;
+
+  @override
+  Future<CheckoutSnapshot> fetchStatus(CheckoutSession session) {
+    calls++;
+    return response.future;
   }
 }
 
@@ -26,6 +42,63 @@ CheckoutSession _session() => CheckoutSession(
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  test('concurrent refreshes share one request and ignore disposal completion',
+      () async {
+    final transport = _PendingTransport();
+    final controller =
+        CheckoutController(session: _session(), transport: transport);
+    var notifications = 0;
+    controller.addListener(() => notifications++);
+    final first = controller.refresh();
+    expect(controller.state, isA<CheckoutRefreshing>());
+    expect(controller.isRefreshing, isTrue);
+    await controller.refresh();
+    expect(transport.calls, 1);
+    controller.dispose();
+    transport.response.complete(CheckoutSnapshot(
+        status: CheckoutStatus.paid, expiresAt: _session().expiresAt));
+    await first;
+    expect(controller.state, isA<CheckoutDisposed>());
+    expect(controller.status, CheckoutStatus.pending);
+    expect(controller.isRefreshing, isFalse);
+    expect(notifications, 1);
+    await controller.refresh();
+    expect(transport.calls, 1);
+  });
+
+  test('pausing blocks requests and resume refreshes once', () async {
+    final transport = _PendingTransport();
+    final controller =
+        CheckoutController(session: _session(), transport: transport);
+    controller.didChangeAppLifecycleState(AppLifecycleState.paused);
+    await controller.refresh();
+    expect(transport.calls, 0);
+    controller.didChangeAppLifecycleState(AppLifecycleState.resumed);
+    expect(transport.calls, 1);
+    controller.didChangeAppLifecycleState(AppLifecycleState.resumed);
+    expect(transport.calls, 1);
+    controller.dispose();
+    transport.response.completeError(Exception('closed'));
+    await Future<void>.delayed(Duration.zero);
+    expect(controller.state, isA<CheckoutDisposed>());
+  });
+
+  test('failure payload is cleared by a successful retry', () async {
+    final controller = CheckoutController(
+      session: _session(),
+      transport:
+          _SequenceTransport([Exception('offline'), CheckoutStatus.pending]),
+    );
+    addTearDown(controller.dispose);
+    await controller.refresh();
+    expect(controller.state, isA<CheckoutFailure>());
+    expect((controller.state as CheckoutFailure).failures, 1);
+    await controller.refresh();
+    expect(controller.state, isA<CheckoutReady>());
+    expect(controller.transportError, isNull);
+    expect(controller.status, CheckoutStatus.pending);
+  });
 
   test('transport errors never become a payment status', () async {
     final controller = CheckoutController(

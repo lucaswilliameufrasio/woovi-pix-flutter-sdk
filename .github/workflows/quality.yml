@@ -1,0 +1,64 @@
+name: Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flutter:
+    name: Flutter (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [package, example]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          install_args: flutter
+      - name: Format, analyze, test and build
+        run: bash scripts/check-flutter.sh "${{ matrix.target }}"
+
+  backend:
+    name: Go + PostgreSQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      COMPOSE_PROJECT_NAME: woovi-pix-ci
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          install_args: go
+      - name: Install pinned Go linter
+        run: |
+          mise exec -- go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+          mise exec -- go env GOPATH | sed 's|$|/bin|' >> "$GITHUB_PATH"
+      - name: Start isolated PostgreSQL
+        working-directory: examples/backend
+        run: docker compose up -d --wait postgres
+      - name: Format, lint, test and build
+        run: |
+          PGPORT="$(docker compose -f examples/backend/docker-compose.yml port postgres 5432 | sed 's/.*://')"
+          # Public local-test credentials only; never use a merchant database.
+          export DATABASE_URL="postgres://woovi_demo:woovi_demo@127.0.0.1:${PGPORT}/woovi_demo?sslmode=disable"
+          bash scripts/check-backend.sh
+      - name: Stop PostgreSQL without deleting data
+        if: always()
+        working-directory: examples/backend
+        run: docker compose stop postgres

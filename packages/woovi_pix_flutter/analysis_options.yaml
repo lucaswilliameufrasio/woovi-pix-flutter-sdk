@@ -2,3 +2,7 @@ analyzer:
   exclude:
     - build/**
 include: package:flutter_lints/flutter.yaml
+linter:
+  rules:
+    curly_braces_in_flow_control_structures: true
+    always_put_control_body_on_new_line: true

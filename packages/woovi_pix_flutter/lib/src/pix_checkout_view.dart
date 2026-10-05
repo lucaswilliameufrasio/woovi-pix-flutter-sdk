@@ -19,6 +19,14 @@ class _PixCheckoutViewState extends State<PixCheckoutView> {
   bool _notifiedPaid = false;
 
   @override
+  void didUpdateWidget(covariant PixCheckoutView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      _notifiedPaid = false;
+    }
+  }
+
+  @override
   Widget build(BuildContext context) => AnimatedBuilder(
         animation: widget.controller,
         builder: (context, _) {
@@ -26,7 +34,9 @@ class _PixCheckoutViewState extends State<PixCheckoutView> {
           if (controller.status == CheckoutStatus.paid && !_notifiedPaid) {
             _notifiedPaid = true;
             WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (mounted) widget.onPaid?.call();
+              if (mounted && widget.controller == controller) {
+                widget.onPaid?.call();
+              }
             });
           }
           final session = controller.session;
@@ -68,14 +78,19 @@ class _PixCheckoutViewState extends State<PixCheckoutView> {
                   const Text('Aguardando os dados Pix do servidor.'),
                 if (controller.transportError != null)
                   Text(
-                      'Não foi possível consultar. O pagamento continua sem confirmação.',
+                      controller.status == CheckoutStatus.pending
+                          ? 'Não foi possível consultar. O pagamento continua sem confirmação.'
+                          : 'Não foi possível atualizar. O último estado confirmado pelo servidor foi preservado.',
                       style: TextStyle(
                           color: Theme.of(context).colorScheme.error)),
                 if (controller.transportError != null ||
                     controller.status == CheckoutStatus.pending)
                   OutlinedButton(
-                      onPressed: controller.refresh,
-                      child: const Text('Consultar novamente')),
+                      onPressed:
+                          controller.isRefreshing ? null : controller.refresh,
+                      child: Text(controller.isRefreshing
+                          ? 'Consultando…'
+                          : 'Consultar novamente')),
               ],
             ),
           );
