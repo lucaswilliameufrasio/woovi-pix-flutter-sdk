@@ -141,6 +141,18 @@ func TestDemoPaymentRouteIsDisabledByDefault(t *testing.T) {
 		t.Fatalf("demo payment route status = %d, want 404 when disabled", response.Code)
 	}
 	assertAPIError(t, response, http.StatusNotFound, "RESOURCE_NOT_FOUND", false)
+	consoleRequest := httptest.NewRequest(http.MethodGet, "/sandbox", nil)
+	consoleResponse := httptest.NewRecorder()
+	handler.ServeHTTP(consoleResponse, consoleRequest)
+	if consoleResponse.Code != http.StatusNotFound {
+		t.Fatalf("sandbox console status = %d, want 404 when sandbox is disabled", consoleResponse.Code)
+	}
+	scenarioRequest := httptest.NewRequest(http.MethodPost, "/v1/sandbox/test-scenarios/paid?checkout_id=checkout", nil)
+	scenarioResponse := httptest.NewRecorder()
+	handler.ServeHTTP(scenarioResponse, scenarioRequest)
+	if scenarioResponse.Code != http.StatusNotFound {
+		t.Fatalf("sandbox scenario status = %d, want 404 when sandbox is disabled", scenarioResponse.Code)
+	}
 }
 
 type testWebhookVerifier struct {

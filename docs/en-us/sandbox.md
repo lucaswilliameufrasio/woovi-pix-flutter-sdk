@@ -46,9 +46,15 @@ read -rsp 'Sandbox AppID: ' WOOVI_APP_ID
 export WOOVI_APP_ID
 export DEMO_ADDR=127.0.0.1:8080
 unset ENABLE_DEMO_PSP ENABLE_WOOVI_WEBHOOK ENABLE_WOOVI_RECONCILIATION
-# Record SANDBOX_SESSION_TOKEN for the app terminal (not the AppID).
+# Copy SANDBOX_SESSION_TOKEN exactly into the app terminal (not the AppID).
 mise exec -- go run ./cmd/server
 ```
+
+The token is generated in terminal 1 and is **not automatically shared** with
+terminal 2. Replace the example text with the value shown by running
+`printf '%s\n' "$SANDBOX_SESSION_TOKEN"` in the backend terminal. Do not paste
+the AppID here. If you restart the backend and generate a new token, stop and
+restart the app with that new value.
 
 Configuration rejects a missing PostgreSQL connection, short token, URL other
 than the sandbox base, and mixing with the simulated PSP. The simulated
@@ -77,6 +83,45 @@ backend every 3 seconds; the backend looks up the charge through GET and
 confirms `paid` without a QR.
 The AppID is never sent to Flutter. The test session token **is embedded in
 the example app**: do not distribute this APK or use this mechanism in production.
+
+### Backend-served test console
+
+Open <http://127.0.0.1:8080/sandbox> in a browser. Enter the same
+`SANDBOX_SESSION_TOKEN`, current round's order ID, and
+`SANDBOX_IDEMPOTENCY_KEY` used by the app. The console recovers the checkout
+with the same key and offers:
+
+- **Request successful payment in Woovi sandbox**: the backend looks up the
+  charge and calls Woovi's official test-payment endpoint using its
+  `transactionID`; the AppID never reaches the browser. The `paid` response
+  still depends on the subsequent PSP GET lookup.
+- **Local: paid / expired / expired then paid**: synthetic in-memory responses
+  for observing app behavior. They do not change Woovi or the PostgreSQL ledger
+  and disappear when the backend restarts.
+
+A paid sandbox charge is terminal and cannot be paid again. After the app shows
+`paid` (or `expired`), tap **Iniciar nova rodada sandbox**: the backend creates
+a new R$ 25.99 test order and the app generates a new idempotency key. The
+current round's order and key are shown on screen for recovery after an app
+restart; pass them as `SANDBOX_ORDER_ID` and `SANDBOX_IDEMPOTENCY_KEY` if that
+round's outcome is still uncertain. Enter the new order in the test console as
+well. Do not reuse the key from a paid round.
+
+The console does not simulate signed webhooks or internal PSP states. Use local
+HTTP fixtures to validate those contracts. Woovi documents the
+[test-payment operation](https://developers.woovi.com/en/docs/test-environment/test-account/test-pay-pix);
+no real call to the sandbox endpoint was made during development. Keep the
+backend accessible only on the test machine/private network.
+
+### If `UNAUTHORIZED` appears
+
+When creating a checkout, this 401 is returned by the backend before it calls
+Woovi: the app's `X-Sandbox-Session` header does not match the token configured
+in the Go process (or is shorter than 32 characters). Verify both terminals use
+the same token, restart the app after changing the `--dart-define`, and confirm
+the request reaches the sandbox backend at the port configured by `DEMO_ADDR`.
+An invalid AppID normally appears later as a Woovi integration error, not this
+local authorization error.
 
 ## 4. Recover without duplicating charges
 

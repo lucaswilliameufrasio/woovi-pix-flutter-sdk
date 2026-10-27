@@ -33,9 +33,14 @@ You do not need a Woovi account to try the simulated flow.
 
 **[Open the demo guide →](docs/en-us/demo.md)**
 
-You will need Docker Compose and mise. The project pins Flutter **3.47.5**,
-Go **1.27.1**, and PostgreSQL **18**. The package declares Flutter 3.24+ / Dart 3.5+
-support; local checks use the pinned version.
+You will need Docker Compose and mise. The project pins Flutter **3.47.8**,
+Go **1.27.3**, and PostgreSQL **18.6**. The package declares Flutter 3.24+ / Dart 3.5+
+support; local checks use the pinned version. `qr_flutter` 4.1.0 is the latest
+published stable version; `http` resolves to 1.6.0 in the lockfile.
+QR version clarification: `qr_flutter` uses its v4 API, but depends on `qr`
+3.0.2; the lockfile does not use `qr` 4.0 because upstream `qr_flutter` requires
+`^3.0.1`. The QR symbol version (1–40) is selected with `QrVersions.auto` based
+on the payload, so a short payload can indeed produce a version-3 symbol.
 
 ## Guides by goal
 

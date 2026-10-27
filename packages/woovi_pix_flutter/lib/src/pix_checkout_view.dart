@@ -62,6 +62,7 @@ class _PixCheckoutViewState extends State<PixCheckoutView> {
                   Center(
                       child: QrImageView(
                           data: pixCopyPaste,
+                          version: QrVersions.auto,
                           size: 220,
                           semanticsLabel: 'QR Code Pix')),
                   SelectableText(pixCopyPaste),

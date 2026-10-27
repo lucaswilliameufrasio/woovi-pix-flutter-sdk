@@ -27,6 +27,7 @@ type WooviChargeClient struct {
 
 type WooviCharge struct {
 	CorrelationID string
+	TransactionID string
 	Status        string
 	Value         int64
 	BRCode        string
@@ -107,9 +108,13 @@ func (c *WooviChargeClient) CreateCharge(ctx context.Context, correlationID stri
 	}
 	var decoded struct {
 		CorrelationID string `json:"correlationID"`
+		TransactionID string `json:"transactionID"`
+		Identifier    string `json:"identifier"`
 		BRCode        string `json:"brCode"`
 		Charge        struct {
 			CorrelationID string `json:"correlationID"`
+			TransactionID string `json:"transactionID"`
+			Identifier    string `json:"identifier"`
 			Status        string `json:"status"`
 			Value         int64  `json:"value"`
 			BRCode        string `json:"brCode"`
@@ -134,11 +139,53 @@ func (c *WooviChargeClient) CreateCharge(ctx context.Context, correlationID stri
 	if decoded.Charge.Status == "" || err != nil || (decoded.Charge.Status == "ACTIVE" && brCode == "") {
 		return WooviCharge{}, errors.New("woovi charge response is missing status or valid expiry, or active charge brCode")
 	}
+	transactionID := decoded.Charge.TransactionID
+	if transactionID == "" {
+		transactionID = decoded.Charge.Identifier
+	}
+	if transactionID == "" {
+		transactionID = decoded.TransactionID
+	}
+	if transactionID == "" {
+		transactionID = decoded.Identifier
+	}
 	value := decoded.Charge.Value
 	if value == 0 {
 		value = amountCents
 	}
-	return WooviCharge{CorrelationID: correlationID, Status: decoded.Charge.Status, Value: value, BRCode: brCode, ExpiresAt: expiresAt.UTC()}, nil
+	return WooviCharge{CorrelationID: correlationID, TransactionID: transactionID, Status: decoded.Charge.Status, Value: value, BRCode: brCode, ExpiresAt: expiresAt.UTC()}, nil
+}
+
+// SimulatePayment invokes Woovi's test-only charge payment endpoint. The
+// configured base URL is validated as the sandbox before this method is exposed.
+func (c *WooviChargeClient) SimulatePayment(ctx context.Context, transactionID string) error {
+	if transactionID == "" || len(transactionID) > 128 {
+		return errors.New("invalid Woovi sandbox transactionID")
+	}
+	endpoint := *c.base
+	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/openpix/testing"
+	endpoint.RawPath = ""
+	query := endpoint.Query()
+	query.Set("transactionID", transactionID)
+	endpoint.RawQuery = query.Encode()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return fmt.Errorf("build Woovi sandbox payment simulation request: %w", err)
+	}
+	request.Header.Set("Authorization", c.appID)
+	request.Header.Set("Accept", "application/json")
+	response, err := c.client.Do(request)
+	if err != nil {
+		return fmt.Errorf("woovi sandbox payment simulation failed: %w", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("woovi sandbox payment simulation returned HTTP %d", response.StatusCode)
+	}
+	if _, err := io.Copy(io.Discard, io.LimitReader(response.Body, maxWooviResponseBytes+1)); err != nil {
+		return fmt.Errorf("read Woovi sandbox payment simulation response: %w", err)
+	}
+	return nil
 }
 
 // GetCharge retrieves one charge by its documented charge ID or correlationID.
@@ -176,6 +223,8 @@ func (c *WooviChargeClient) GetCharge(ctx context.Context, correlationID string)
 	var decoded struct {
 		Charge struct {
 			CorrelationID string `json:"correlationID"`
+			TransactionID string `json:"transactionID"`
+			Identifier    string `json:"identifier"`
 			Value         int64  `json:"value"`
 			Status        string `json:"status"`
 			BRCode        string `json:"brCode"`
@@ -192,8 +241,13 @@ func (c *WooviChargeClient) GetCharge(ctx context.Context, correlationID string)
 	if err != nil {
 		return WooviCharge{}, errors.New("woovi charge lookup returned an invalid expiresDate")
 	}
+	transactionID := decoded.Charge.TransactionID
+	if transactionID == "" {
+		transactionID = decoded.Charge.Identifier
+	}
 	return WooviCharge{
 		CorrelationID: decoded.Charge.CorrelationID,
+		TransactionID: transactionID,
 		Status:        decoded.Charge.Status,
 		Value:         decoded.Charge.Value,
 		BRCode:        decoded.Charge.BRCode,

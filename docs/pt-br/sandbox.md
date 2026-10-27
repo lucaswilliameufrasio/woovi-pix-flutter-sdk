@@ -44,9 +44,15 @@ read -rsp 'AppID do sandbox: ' WOOVI_APP_ID
 export WOOVI_APP_ID
 export DEMO_ADDR=127.0.0.1:8080
 unset ENABLE_DEMO_PSP ENABLE_WOOVI_WEBHOOK ENABLE_WOOVI_RECONCILIATION
-# Anote SANDBOX_SESSION_TOKEN para usar no terminal do app (não o AppID).
+# Copie SANDBOX_SESSION_TOKEN exatamente para o terminal do app (não o AppID).
 mise exec -- go run ./cmd/server
 ```
+
+O token é gerado pelo primeiro terminal e **não é compartilhado automaticamente**
+com o segundo. Substitua o texto de exemplo pelo valor exibido ao executar
+`printf '%s\n' "$SANDBOX_SESSION_TOKEN"` no terminal do backend. Não copie o
+AppID nesse campo. Se reiniciar o backend e gerar outro token, encerre e inicie
+novamente o app com o novo valor.
 
 A configuração rejeita PostgreSQL ausente, token curto, URL diferente da base
 sandbox e mistura com PSP simulado. A rota simulada de criação fica ausente.
@@ -73,6 +79,45 @@ cobrança no sandbox. Simule sua conclusão na Woovi: o app consulta o backend a
 cada 3s; o backend consulta a cobrança via GET e confirma `paid` sem QR.
 AppID nunca é enviado ao Flutter. O token da sessão de teste **é incorporado ao
 app exemplo**: não distribua esse APK, nem use esse mecanismo em produção.
+
+### Console de teste servido pelo backend
+
+Abra <http://127.0.0.1:8080/sandbox> no navegador. Informe o mesmo
+`SANDBOX_SESSION_TOKEN`, o pedido da rodada atual e o
+`SANDBOX_IDEMPOTENCY_KEY` usados pelo app. O console recupera o checkout com a
+mesma chave e oferece:
+
+- **Solicitar pagamento de sucesso na Woovi sandbox**: o backend consulta a
+  cobrança e chama o endpoint oficial de pagamento de teste da Woovi com o
+  `transactionID`; o AppID nunca passa pelo navegador. A resposta `paid` continua
+  dependendo da consulta GET subsequente ao PSP.
+- **Local: pago / expirado / expirado e depois pago**: respostas sintéticas,
+  em memória, apenas para observar o comportamento do app. Não alteram Woovi nem
+  o ledger PostgreSQL e desaparecem ao reiniciar o backend.
+
+Uma cobrança sandbox paga é terminal e não pode ser paga de novo. Depois que o
+app mostrar `paid` (ou `expired`), toque **Iniciar nova rodada sandbox**: o
+backend cria um novo pedido de teste de R$ 25,99 e o app gera uma nova chave de
+idempotência. O pedido e a chave da rodada atual aparecem na tela para permitir
+recuperação após reiniciar o app; use-os em `SANDBOX_ORDER_ID` e
+`SANDBOX_IDEMPOTENCY_KEY` se o resultado dessa rodada ainda estiver incerto.
+Informe também o novo pedido no console. Não reutilize a chave de uma rodada paga.
+
+O console não simula webhooks assinados nem estados internos do PSP. Use fixtures
+HTTP locais para validar esses contratos. A documentação oficial descreve a
+[operação de pagamento de teste](https://developers.woovi.com/en/docs/test-environment/test-account/test-pay-pix);
+nenhuma chamada real ao endpoint sandbox foi feita durante o desenvolvimento.
+Mantenha o backend acessível somente na máquina/rede privada de teste.
+
+### Se aparecer `UNAUTHORIZED`
+
+Na criação do checkout, esse 401 é emitido pelo próprio backend antes de chamar
+a Woovi: o cabeçalho `X-Sandbox-Session` do app não corresponde ao token
+configurado no processo Go (ou tem menos de 32 caracteres). Confirme que ambos
+os terminais usam o mesmo token, que o app foi iniciado de novo após alterar o
+`--dart-define`, e que a chamada está indo para o backend sandbox na porta
+configurada em `DEMO_ADDR`. O AppID inválido normalmente só aparece depois, como
+erro da integração com a Woovi, não como esse erro local de autorização.
 
 ## 4. Recuperar erros sem duplicar cobranças
 

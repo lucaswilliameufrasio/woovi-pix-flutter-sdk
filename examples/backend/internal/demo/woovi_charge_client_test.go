@@ -29,7 +29,7 @@ func TestWooviChargeClientUsesDocumentedServerRequest(t *testing.T) {
 			t.Errorf("request body = %#v", body)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"correlationID":"order-42","brCode":"top-level-brcode","charge":{"correlationID":"order-42","status":"ACTIVE","brCode":"000201-test","expiresDate":"2030-01-01T00:00:00.123Z"}}`))
+		_, _ = w.Write([]byte(`{"correlationID":"order-42","brCode":"top-level-brcode","charge":{"correlationID":"order-42","transactionID":"transaction-42","status":"ACTIVE","brCode":"000201-test","expiresDate":"2030-01-01T00:00:00.123Z"}}`))
 	}))
 	defer server.Close()
 
@@ -41,7 +41,7 @@ func TestWooviChargeClientUsesDocumentedServerRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if charge.CorrelationID != "order-42" || charge.Status != "ACTIVE" || charge.BRCode != "000201-test" ||
+	if charge.CorrelationID != "order-42" || charge.TransactionID != "transaction-42" || charge.Status != "ACTIVE" || charge.BRCode != "000201-test" ||
 		!charge.ExpiresAt.Equal(time.Date(2030, 1, 1, 0, 0, 0, 123_000_000, time.UTC)) {
 		t.Fatalf("parsed charge = %#v", charge)
 	}
@@ -123,7 +123,7 @@ func TestWooviChargeLookupUsesCorrelationIDAndValidatesResponse(t *testing.T) {
 		if r.Header.Get("Authorization") != appID {
 			t.Error("lookup omitted backend AppID")
 		}
-		_, _ = w.Write([]byte(`{"charge":{"correlationID":"order/42","value":2599,"status":"COMPLETED","brCode":"pix-value","expiresDate":"2030-01-01T00:00:00Z"}}`))
+		_, _ = w.Write([]byte(`{"charge":{"correlationID":"order/42","transactionID":"transaction-42","value":2599,"status":"COMPLETED","brCode":"pix-value","expiresDate":"2030-01-01T00:00:00Z"}}`))
 	}))
 	defer server.Close()
 	client, err := NewWooviChargeClient(appID, server.URL, server.Client())
@@ -134,7 +134,31 @@ func TestWooviChargeLookupUsesCorrelationIDAndValidatesResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if charge.CorrelationID != "order/42" || charge.Status != "COMPLETED" || charge.Value != 2599 {
+	if charge.CorrelationID != "order/42" || charge.TransactionID != "transaction-42" || charge.Status != "COMPLETED" || charge.Value != 2599 {
 		t.Fatalf("charge lookup = %#v", charge)
+	}
+}
+
+func TestWooviSandboxPaymentSimulationUsesDocumentedTestEndpoint(t *testing.T) {
+	const appID = "fixture-only-app-id"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/openpix/testing" || r.URL.Query().Get("transactionID") != "transaction-42" {
+			t.Errorf("simulation request = %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+		if r.Header.Get("Authorization") != appID {
+			t.Error("simulation request omitted the backend AppID")
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	client, err := NewWooviChargeClient(appID, server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SimulatePayment(context.Background(), "transaction-42"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SimulatePayment(context.Background(), ""); err == nil {
+		t.Fatal("empty transaction identifier must be rejected")
 	}
 }

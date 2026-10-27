@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -39,13 +40,20 @@ type checkout struct {
 	brCode        string
 }
 
+type sandboxScenario struct {
+	statuses []Status
+	next     int
+}
+
 type Server struct {
-	store            CheckoutStore
-	clockNow         func() time.Time
-	webhookAuth      WebhookVerifier
-	allowDemoPay     bool
-	merchantCheckout *merchantCheckoutService
-	sandboxLookup    *WooviChargeClient
+	store             CheckoutStore
+	clockNow          func() time.Time
+	webhookAuth       WebhookVerifier
+	allowDemoPay      bool
+	merchantCheckout  *merchantCheckoutService
+	sandboxLookup     *WooviChargeClient
+	sandboxScenarios  map[string]*sandboxScenario
+	sandboxScenarioMu sync.Mutex
 }
 
 func NewServer() *Server {
@@ -74,6 +82,12 @@ func (s *Server) Handler() http.Handler {
 	})
 	if s.sandboxLookup == nil {
 		mux.HandleFunc("POST "+apiCheckoutSessionsPath, s.createSession)
+	}
+	if s.sandboxLookup != nil {
+		mux.HandleFunc("GET /sandbox", s.sandboxConsole)
+		mux.HandleFunc("POST /v1/sandbox/test-orders", s.createSandboxTestOrder)
+		mux.HandleFunc("POST /v1/sandbox/test-pay", s.simulateSandboxPayment)
+		mux.HandleFunc("POST /v1/sandbox/test-scenarios/{scenario}", s.setSandboxScenario)
 	}
 	if s.merchantCheckout != nil {
 		mux.HandleFunc("POST /v1/merchant/checkout-sessions", s.createMerchantCheckout)
@@ -261,6 +275,10 @@ func (s *Server) getStatus(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, unexpectedError())
 		return
 	}
+	if status, simulated := s.sandboxScenarioStatus(c.id); simulated {
+		writeJSON(w, http.StatusOK, map[string]any{"status": status, "expires_at": c.expiresAt.UTC().Format(time.RFC3339)})
+		return
+	}
 	if s.sandboxLookup != nil && c.orderID == "sandbox-order-1" && c.status != Paid {
 		if err := s.refreshSandboxSession(r.Context(), c); err != nil {
 			writeAPIError(w, dependencyError("PAYMENT_PROCESSING", "Não foi possível consultar o pagamento", "CHARGE_LOOKUP_FAILED"))
@@ -273,6 +291,116 @@ func (s *Server) getStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": c.status, "expires_at": c.expiresAt.UTC().Format(time.RFC3339)})
+}
+
+func (s *Server) setSandboxScenario(w http.ResponseWriter, r *http.Request) {
+	provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if provided == "" || provided == r.Header.Get("Authorization") {
+		writeAPIError(w, unauthorized())
+		return
+	}
+	checkoutID := r.URL.Query().Get("checkout_id")
+	if checkoutID == "" {
+		writeAPIError(w, invalidParams("checkout_id", "é obrigatório"))
+		return
+	}
+	tokenHash := sha256.Sum256([]byte(provided))
+	checkoutSession, err := s.store.Status(r.Context(), checkoutID, tokenHash, s.clockNow())
+	if errors.Is(err, ErrCheckoutUnauthorized) {
+		writeAPIError(w, unauthorized())
+		return
+	}
+	if errors.Is(err, ErrCheckoutNotFound) {
+		writeAPIError(w, resourceNotFound("checkout"))
+		return
+	}
+	if err != nil {
+		writeAPIError(w, unexpectedError())
+		return
+	}
+	if checkoutSession.orderID != "sandbox-order-1" {
+		writeAPIError(w, resourceNotFound("checkout"))
+		return
+	}
+	var statuses []Status
+	switch r.PathValue("scenario") {
+	case "paid":
+		statuses = []Status{Paid}
+	case "expired":
+		statuses = []Status{Expired}
+	case "late-paid":
+		statuses = []Status{Expired, Paid}
+	default:
+		writeAPIError(w, resourceNotFound("scenario"))
+		return
+	}
+	s.sandboxScenarioMu.Lock()
+	if s.sandboxScenarios == nil {
+		s.sandboxScenarios = make(map[string]*sandboxScenario)
+	}
+	s.sandboxScenarios[checkoutID] = &sandboxScenario{statuses: statuses}
+	s.sandboxScenarioMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]string{"scenario": r.PathValue("scenario"), "source": "local_test_simulation"})
+}
+
+func (s *Server) simulateSandboxPayment(w http.ResponseWriter, r *http.Request) {
+	provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if provided == "" || provided == r.Header.Get("Authorization") {
+		writeAPIError(w, unauthorized())
+		return
+	}
+	checkoutID := r.URL.Query().Get("checkout_id")
+	if checkoutID == "" {
+		writeAPIError(w, invalidParams("checkout_id", "é obrigatório"))
+		return
+	}
+	tokenHash := sha256.Sum256([]byte(provided))
+	checkoutSession, err := s.store.Status(r.Context(), checkoutID, tokenHash, s.clockNow())
+	if errors.Is(err, ErrCheckoutUnauthorized) {
+		writeAPIError(w, unauthorized())
+		return
+	}
+	if errors.Is(err, ErrCheckoutNotFound) {
+		writeAPIError(w, resourceNotFound("checkout"))
+		return
+	}
+	if err != nil {
+		writeAPIError(w, unexpectedError())
+		return
+	}
+	if checkoutSession.orderID != "sandbox-order-1" {
+		writeAPIError(w, resourceNotFound("checkout"))
+		return
+	}
+	charge, err := s.sandboxLookup.GetCharge(r.Context(), checkoutSession.correlationID)
+	if err != nil || charge.CorrelationID != checkoutSession.correlationID || charge.Value != checkoutSession.amount || charge.Status != "ACTIVE" || charge.TransactionID == "" {
+		writeAPIError(w, dependencyError("PAYMENT_PROCESSING", "Não foi possível preparar a simulação de pagamento sandbox", "SANDBOX_TEST_PAYMENT_UNAVAILABLE"))
+		return
+	}
+	if err := s.sandboxLookup.SimulatePayment(r.Context(), charge.TransactionID); err != nil {
+		writeAPIError(w, dependencyError("PAYMENT_PROCESSING", "A Woovi não confirmou a simulação de pagamento sandbox", "SANDBOX_TEST_PAYMENT_FAILED"))
+		return
+	}
+	s.sandboxScenarioMu.Lock()
+	delete(s.sandboxScenarios, checkoutID)
+	s.sandboxScenarioMu.Unlock()
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "payment_simulation_requested", "source": "woovi_sandbox"})
+}
+
+func (s *Server) sandboxScenarioStatus(checkoutID string) (Status, bool) {
+	s.sandboxScenarioMu.Lock()
+	defer s.sandboxScenarioMu.Unlock()
+	scenario, exists := s.sandboxScenarios[checkoutID]
+	if !exists || len(scenario.statuses) == 0 {
+		return "", false
+	}
+	index := scenario.next
+	if index >= len(scenario.statuses) {
+		index = len(scenario.statuses) - 1
+	} else {
+		scenario.next++
+	}
+	return scenario.statuses[index], true
 }
 
 func (s *Server) simulatePaid(w http.ResponseWriter, r *http.Request) {

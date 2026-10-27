@@ -150,6 +150,8 @@ void main() {
     var paidCalls = 0;
     await tester.pumpWidget(_view(controller, () => paidCalls++));
     expect(find.byType(QrImageView), findsOneWidget);
+    final qrWidget = tester.widget<QrImageView>(find.byType(QrImageView));
+    expect(qrWidget.version, QrVersions.auto);
     await tester.tap(find.text('Copiar código Pix'));
     await tester.pump();
     expect(copied, 'pix-test');
