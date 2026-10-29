@@ -3,7 +3,7 @@
 [Home](../../README-en-us.md) · [Português (Brasil)](../pt-br/sandbox.md)
 
 Use this guide after trying the [local demo](demo.md).
-Commands start at the repository root and use Bash.
+The onboarding and run commands use the example's Go CLI.
 
 > **Testing only:** use a separate account and isolated database. Do not expose
 > the server publicly or pay with a real bank. No sandbox calls have been
@@ -25,64 +25,44 @@ Also prepare the test bank account as described in
 and follow [paying a test Pix charge](https://developers.woovi.com/en/docs/test-environment/test-account/test-pay-pix)
 to confirm the charge created by the app.
 
-## 2. Start the backend (terminal 1)
+## 2. Configure and run
 
-This mode uses a single fixed order, `sandbox-order-1`, worth BRL 25.99, and a
-shared test session. This is not production authentication. Use an isolated
-database, do not expose this server publicly, and do not reuse the token
-outside this example.
+Prerequisites: `mise`, Docker Compose, and a connected Flutter simulator/device.
+On first run, the CLI prompts for the sandbox AppID without echoing it, generates
+test tokens, and saves them to `examples/backend/.env`. On macOS/Linux, the file
+is created with `0600` permissions and is ignored by Git. Do not share it.
 
 ```sh
 mise install
 cd examples/backend
-docker compose -p woovi-pix-flutter-sdk-sandbox up -d --wait postgres
-PGPORT="$(docker compose -p woovi-pix-flutter-sdk-sandbox port postgres 5432 | sed 's/.*://')"
-export DATABASE_URL="postgres://woovi_demo:woovi_demo@127.0.0.1:${PGPORT}/woovi_demo?sslmode=disable"
-export ENABLE_WOOVI_SANDBOX_CHECKOUT=true
-export WOOVI_API_BASE_URL=https://api.woovi-sandbox.com
-export SANDBOX_SESSION_TOKEN="$(openssl rand -hex 32)"
-# Bash: read without echoing or putting a literal credential in shell history
-read -rsp 'Sandbox AppID: ' WOOVI_APP_ID
-export WOOVI_APP_ID
-export DEMO_ADDR=127.0.0.1:8080
-unset ENABLE_DEMO_PSP ENABLE_WOOVI_WEBHOOK ENABLE_WOOVI_RECONCILIATION
-# Copy SANDBOX_SESSION_TOKEN exactly into the app terminal (not the AppID).
-mise exec -- go run ./cmd/server
+mise exec -- go run ./cmd/woovi-demo
 ```
 
-The token is generated in terminal 1 and is **not automatically shared** with
-terminal 2. Replace the example text with the value shown by running
-`printf '%s\n' "$SANDBOX_SESSION_TOKEN"` in the backend terminal. Do not paste
-the AppID here. If you restart the backend and generate a new token, stop and
-restart the app with that new value.
+This single command starts local PostgreSQL, the backend, and Flutter. You can
+also run onboarding separately with `mise exec -- go run ./cmd/woovi-demo
+setup`. The AppID stays in the Go process; the CLI creates a protected temporary
+file to pass the session token to Flutter without putting it in shell history.
+The token is still embedded in the test app: do not distribute this build or
+use this mechanism in production.
 
-Configuration rejects a missing PostgreSQL connection, short token, URL other
-than the sandbox base, and mixing with the simulated PSP. The simulated
-creation route is absent. The independent worker is disabled in this example:
-replays reconcile ambiguous outcomes through GET, and authenticated status
-queries check the PSP through GET.
-
-## 3. Start the app (terminal 2)
+For an iOS simulator, choose the target explicitly:
 
 ```sh
-cd example
-export SANDBOX_SESSION_TOKEN='PASTE_BACKEND_TEST_TOKEN'
-export SANDBOX_IDEMPOTENCY_KEY="$(openssl rand -hex 16)"
-# Record and preserve this key even after an error/app restart.
-mise exec -- flutter pub get
-mise exec -- flutter run \
-  --dart-define=WOOVI_SANDBOX=true \
-  --dart-define=SANDBOX_SESSION_TOKEN="$SANDBOX_SESSION_TOKEN" \
-  --dart-define=SANDBOX_IDEMPOTENCY_KEY="$SANDBOX_IDEMPOTENCY_KEY" \
-  --dart-define=DEMO_BACKEND=http://10.0.2.2:8080
+mise exec -- go run ./cmd/woovi-demo run --platform ios --device-id SIMULATOR_ID
 ```
 
-Tap **Pagar com Pix**: the app now calls `/v1/merchant/checkout-sessions` and
-creates a sandbox charge. Simulate completion in Woovi: the app polls the
-backend every 3 seconds; the backend looks up the charge through GET and
-confirms `paid` without a QR.
-The AppID is never sent to Flutter. The test session token **is embedded in
-the example app**: do not distribute this APK or use this mechanism in production.
+To start a fresh round after the previous one is terminal, run
+`mise exec -- go run ./cmd/woovi-demo run --new-round`. **Do not use `--new-round`
+if the previous outcome is uncertain**; reopen the app with the same config to
+recover that checkout using `mise exec -- go run ./cmd/woovi-demo run --resume`,
+then enter the order ID and idempotency key shown by the app. `Ctrl+C` stops the
+app and backend, then stops PostgreSQL without deleting its volume.
+
+Tap **Pagar com Pix** to create a sandbox charge. Confirm it using the test
+account and Woovi's test dashboard; the app polls the backend every 3 seconds.
+The CLI only starts local services and does not request a payment from Woovi. It
+rejects the simulated PSP configuration and disables the independent worker;
+ambiguous outcomes are reconciled through GET.
 
 ### Backend-served test console
 
